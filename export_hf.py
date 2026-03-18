@@ -270,6 +270,7 @@ def generate_build_toml(
     name: str,
     functions: List[Dict[str, str]],
     backend: str = "cuda",
+    repo_id: str = "",
 ) -> str:
     """
     Generate the build.toml file for HF Kernels.
@@ -282,34 +283,41 @@ def generate_build_toml(
         List of function signature dicts from extract_function_signatures.
     backend : str
         'cuda' or 'triton'.
+    repo_id : str
+        HuggingFace repo ID for the hub section.
     """
     if backend == "cuda":
         return textwrap.dedent(f"""\
             [general]
             name = "{name}"
+            license = "Apache-2.0"
+            version = 1
+            backends = ["cuda"]
+
+            [general.hub]
+            repo-id = "{repo_id}"
 
             [torch]
             src = [
               "torch-ext/torch_binding.cpp",
-              "torch-ext/torch_binding.h"
+              "torch-ext/torch_binding.h",
             ]
 
             [kernel.{name}]
             backend = "cuda"
-            src = ["kernel_cuda/kernel.cu"]
             depends = ["torch"]
+            src = ["{name}_cuda/kernel.cu"]
         """)
     else:
         # Triton kernels are pure Python -- no CUDA compilation needed
         return textwrap.dedent(f"""\
             [general]
             name = "{name}"
+            license = "Apache-2.0"
+            version = 1
 
-            [torch]
-            src = [
-              "torch-ext/torch_binding.cpp",
-              "torch-ext/torch_binding.h"
-            ]
+            [general.hub]
+            repo-id = "{repo_id}"
         """)
 
 
@@ -317,40 +325,76 @@ def generate_build_toml(
 # File generation: torch_binding.cpp / .h
 # ---------------------------------------------------------------------------
 
+def _param_to_torch_schema(param_type: str, param_name: str) -> str:
+    """Convert a C++ parameter type to a torch.library schema type."""
+    t = param_type.strip()
+    # Remove const, &, * qualifiers for schema
+    for q in ("const ", "&", "*", "__restrict__"):
+        t = t.replace(q, "").strip()
+
+    type_map = {
+        "torch::Tensor": "Tensor",
+        "at::Tensor": "Tensor",
+        "int": "int",
+        "int64_t": "int",
+        "int32_t": "int",
+        "float": "float",
+        "double": "float",
+        "bool": "bool",
+    }
+    schema_type = type_map.get(t, "Tensor")
+    return f"{schema_type} {param_name}"
+
+
+def _build_ops_schema(func: Dict[str, str]) -> str:
+    """Build a torch.library ops.def() schema string for a function."""
+    params = _parse_param_list(func["params"])
+    schema_params = ", ".join(
+        _param_to_torch_schema(ptype, pname) for ptype, pname in params
+    )
+
+    ret = func["return_type"].strip()
+    if "vector" in ret:
+        schema_ret = "Tensor[]"
+    elif "void" in ret:
+        schema_ret = "()"
+    else:
+        schema_ret = "Tensor"
+
+    return f"{func['name']}({schema_params}) -> {schema_ret}"
+
+
 def generate_torch_binding_cpp(
     name: str,
     functions: List[Dict[str, str]],
 ) -> str:
     """
-    Generate torch_binding.cpp with pybind11 module definition.
+    Generate torch_binding.cpp with TORCH_LIBRARY_EXPAND registration.
 
-    This is the PyTorch C++ binding that exposes the CUDA functions to Python.
+    Uses the HuggingFace Kernels convention: torch/library.h + registration.h
+    + REGISTER_EXTENSION macro for compatibility with the kernel-builder
+    Nix build pipeline.
     """
-    # Forward declarations
-    forward_decls = []
+    # Build ops.def() and ops.impl() lines
+    ops_lines = []
     for func in functions:
-        forward_decls.append(f"{func['full_signature']};")
+        schema = _build_ops_schema(func)
+        ops_lines.append(f'  ops.def("{schema}");')
+        ops_lines.append(f'  ops.impl("{func["name"]}", torch::kCUDA, &{func["name"]});')
 
-    # pybind11 module definitions
-    m_def_lines = []
-    for func in functions:
-        m_def_lines.append(
-            f'    m.def("{func["name"]}", &{func["name"]}, "{func["name"]}");'
-        )
-
-    forward_decls_str = "\n".join(forward_decls)
-    m_defs_str = "\n".join(m_def_lines)
+    ops_str = "\n".join(ops_lines)
 
     return textwrap.dedent(f"""\
+        #include <torch/library.h>
+
+        #include "registration.h"
         #include "torch_binding.h"
-        #include <torch/extension.h>
 
-        // Forward declarations (defined in kernel.cu)
-        {forward_decls_str}
-
-        PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
-        {m_defs_str}
+        TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {{
+        {ops_str}
         }}
+
+        REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
     """)
 
 
@@ -366,10 +410,36 @@ def generate_torch_binding_h(
 
     return textwrap.dedent(f"""\
         #pragma once
-        #include <torch/all.h>
+        #include <torch/torch.h>
 
-        // Forward declarations
         {forward_decls_str}
+    """)
+
+
+# ---------------------------------------------------------------------------
+# File generation: flake.nix (Nix build system for kernel-builder)
+# ---------------------------------------------------------------------------
+
+def generate_flake_nix(name: str) -> str:
+    """Generate the flake.nix for the HF kernel-builder Nix pipeline."""
+    return textwrap.dedent(f"""\
+        {{
+          description = "Flake for {name} kernel";
+
+          inputs = {{
+            kernel-builder.url = "github:huggingface/kernels";
+          }};
+
+          outputs =
+            {{
+              self,
+              kernel-builder,
+            }}:
+            kernel-builder.lib.genKernelFlakeOutputs {{
+              inherit self;
+              path = ./.;
+            }};
+        }}
     """)
 
 
@@ -459,19 +529,16 @@ def _export_cuda_kernel(
             print("         torch::Tensor my_kernel_cuda(torch::Tensor A, torch::Tensor B) { ... }")
             sys.exit(1)
 
-    # Create directory structure
+    # Create directory structure (matches kernels-community convention)
     project_dir = os.path.join(output_dir, name)
-    kernel_cuda_dir = os.path.join(project_dir, "kernel_cuda")
+    kernel_cuda_dir = os.path.join(project_dir, f"{name}_cuda")
     torch_ext_dir = os.path.join(project_dir, "torch-ext")
-    module_dir = os.path.join(torch_ext_dir, name)
 
     os.makedirs(kernel_cuda_dir, exist_ok=True)
-    os.makedirs(module_dir, exist_ok=True)
+    os.makedirs(torch_ext_dir, exist_ok=True)
 
     # 1. Write kernel.cu
     kernel_cu_path = os.path.join(kernel_cuda_dir, "kernel.cu")
-    # Clean up the CUDA source: remove #include <torch/extension.h> if present
-    # (HF Kernels build system handles includes via build.toml)
     cuda_src_clean = cuda_src.strip()
     with open(kernel_cu_path, "w", encoding="utf-8") as f:
         f.write(cuda_src_clean)
@@ -480,12 +547,12 @@ def _export_cuda_kernel(
 
     # 2. Write build.toml
     build_toml_path = os.path.join(project_dir, "build.toml")
-    build_toml_content = generate_build_toml(name, functions, backend="cuda")
+    build_toml_content = generate_build_toml(name, functions, backend="cuda", repo_id=repo_id)
     with open(build_toml_path, "w", encoding="utf-8") as f:
         f.write(build_toml_content)
     print(f"  Created {os.path.relpath(build_toml_path, output_dir)}")
 
-    # 3. Write torch_binding.cpp
+    # 3. Write torch_binding.cpp (TORCH_LIBRARY_EXPAND style)
     binding_cpp_path = os.path.join(torch_ext_dir, "torch_binding.cpp")
     binding_cpp_content = generate_torch_binding_cpp(name, functions)
     with open(binding_cpp_path, "w", encoding="utf-8") as f:
@@ -499,12 +566,12 @@ def _export_cuda_kernel(
         f.write(binding_h_content)
     print(f"  Created {os.path.relpath(binding_h_path, output_dir)}")
 
-    # 5. Write __init__.py
-    init_py_path = os.path.join(module_dir, "__init__.py")
-    init_py_content = generate_init_py(name, functions, repo_id, backend="cuda")
-    with open(init_py_path, "w", encoding="utf-8") as f:
-        f.write(init_py_content)
-    print(f"  Created {os.path.relpath(init_py_path, output_dir)}")
+    # 5. Write flake.nix (Nix build for kernel-builder pipeline)
+    flake_nix_path = os.path.join(project_dir, "flake.nix")
+    flake_nix_content = generate_flake_nix(name)
+    with open(flake_nix_path, "w", encoding="utf-8") as f:
+        f.write(flake_nix_content)
+    print(f"  Created {os.path.relpath(flake_nix_path, output_dir)}")
 
     # Print function summary
     print()
@@ -696,14 +763,16 @@ def export_kernel(
         print("  1. Review the exported files:")
         print(f"     ls {project_dir}/")
         print()
-        print("  2. Test locally (requires `pip install kernels`):")
+        print("  2. Build with Nix (cross-compiles for all PyTorch/CUDA combos):")
         print(f"     cd {project_dir}")
-        print("     kernels build .")
+        print("     nix flake lock   # generates flake.lock")
+        print("     nix run -L .#build-and-copy")
+        print()
+        print("     Or use HF's kernel-builder terraform setup:")
+        print("     https://github.com/huggingface/kernels/tree/main/terraform")
         print()
         print("  3. Upload to HuggingFace Hub:")
-        print("     # First: pip install kernels && huggingface-cli login")
-        print(f"     cd {project_dir}")
-        print(f"     kernels upload . --repo_id {repo_id}")
+        print(f"     nix run .#kernels -- upload --repo-id {repo_id}")
         print()
         print("  4. Use from anywhere:")
         print("     from kernels import get_kernel")
