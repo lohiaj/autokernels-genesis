@@ -28,6 +28,13 @@ report.md
 
 # Profiler traces
 traces/
+prof/
+
+# Per-experiment runs (rocprofv3 stats CSVs, e2e JSON)
+runs/
 
 # Workspace (runtime artifacts)
 workspace/
+
+# Analysis output (regenerated)
+progress.png

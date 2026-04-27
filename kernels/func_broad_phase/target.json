@@ -1,0 +1,35 @@
+{
+  "campaign_id": "func_broad_phase",
+  "description": "Collision broad-phase kernel family in Genesis. Currently 12.85x MI300X/H100 ratio; the worst relative slowdown in the top-8 gap kernels.",
+  "tracker_ticket": "TICKET",
+  "owner_human": "(redacted) (current); jlohia + agent (this campaign)",
+  "current_pct_of_h100": 7.78,
+  "target_pct_of_h100": 80.0,
+  "baseline_kernel_avg_us": 449.61,
+  "primary_kernel_pattern": "^_?func_broad_phase_c\\d+_\\d+_kernel_\\d+",
+  "kernel_per_call_h100_us": 35.0,
+  "kernel_per_call_mi300x_baseline_us": 449.61,
+  "edit_files": [
+    {
+      "path": "genesis/engine/solvers/rigid/collider/broadphase.py",
+      "rationale": "Main DSL implementation. ~396 lines. Contains qd.func helpers (func_find_intersect_midpoint, func_check_collision_valid, ...) and the @qd.kernel entry points that get JIT-compiled into the func_broad_phase_c*_kernel_* family."
+    },
+    {
+      "path": "genesis/engine/solvers/rigid/collider/utils.py",
+      "rationale": "Shared collision utilities (func_is_geom_aabbs_overlap, etc.). Allowed to edit if a broad_phase change requires touching a shared helper."
+    }
+  ],
+  "may_also_edit": [],
+  "do_not_edit": [
+    "tests/",
+    "benchmark_scaling.py",
+    "genesis/engine/solvers/rigid/constraint/",
+    "genesis/engine/solvers/rigid/abd/",
+    "../quadrants/"
+  ],
+  "correctness_tests": [
+    "tests/test_rigid_physics.py"
+  ],
+  "correctness_pytest_extra_args": "-k \"collision or broadphase or aabb or contact_island or not (test_convexify or test_mesh_repair or test_mesh_primitive_COM)\"",
+  "playbook_ref": "kernels/func_broad_phase/playbook.md"
+}

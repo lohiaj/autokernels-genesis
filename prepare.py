@@ -1,356 +1,360 @@
+#!/usr/bin/env python3
 """
-AutoKernel -- One-time setup and baseline benchmarking.
+prepare.py -- one-time setup for autokernels-genesis.
 
-Verifies environment (CUDA, Triton, PyTorch), generates deterministic test data,
-runs a smoke test on the current kernel, and benchmarks PyTorch reference
-implementations so that future experiments have a cached baseline to compare
-against.
+Verifies:
+  1. ROCm and gfx942 are present on the host (rocminfo).
+  2. ~/work/Genesis, ~/work/quadrants, ~/work/newton-assets exist.
+  3. Each MI300X GPU is idle enough to use (rocm-smi --showuse).
+  4. The genesis:amd-integration docker image exists.
+  5. Captures a baseline e2e throughput (3 trials) to calibrate the noise floor.
+  6. Loads the hand-curated optimization plan into workspace/orchestration_state.json.
 
 Usage:
-    uv run prepare.py
+  uv run prepare.py                 # full check + 3-trial baseline
+  uv run prepare.py --skip-baseline # env check only (faster)
+  uv run prepare.py --image genesis:amd-integration --container-name ak-prepare
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import os
+import re
+import shlex
+import statistics
+import subprocess
 import sys
+import time
+from pathlib import Path
 
-import torch
-
-# ---------------------------------------------------------------------------
-# Constants (shared with bench.py -- keep in sync)
-# ---------------------------------------------------------------------------
-
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autokernel")
-TEST_DATA_DIR = os.path.join(CACHE_DIR, "test_data")
-BASELINES_PATH = os.path.join(CACHE_DIR, "baselines.json")
-
-# Matmul test sizes (must match bench.py)
-MATMUL_SIZES = [
-    ("tiny",    {"M": 128,  "N": 128,  "K": 128}),
-    ("small",   {"M": 512,  "N": 512,  "K": 512}),
-    ("medium",  {"M": 1024, "N": 1024, "K": 1024}),
-    ("large",   {"M": 2048, "N": 2048, "K": 2048}),
-    ("xlarge",  {"M": 4096, "N": 4096, "K": 4096}),
-]
-
-TEST_DTYPES = [torch.float16, torch.bfloat16]
-
-# Number of warmup and benchmark iterations for baseline timing
-_WARMUP_ITERS = 25
-_BENCH_ITERS = 100
-
-# Deterministic seed for reproducibility
-_SEED = 42
+SCRIPT_DIR = Path(__file__).resolve().parent
+WORKSPACE = SCRIPT_DIR / "workspace"
+KERNELS = SCRIPT_DIR / "kernels"
+AUTOKERNEL_ROOT = Path(os.path.expanduser("~/work"))
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def step(msg: str) -> None:
+    print(f"\n=== {msg} ===")
 
-def _dtype_tag(dtype: torch.dtype) -> str:
-    """Short string tag for a dtype, e.g. 'fp16', 'bf16'."""
-    return {torch.float16: "fp16", torch.bfloat16: "bf16", torch.float32: "fp32"}[dtype]
+def ok(msg: str) -> None:
+    print(f"  ok   {msg}")
 
+def warn(msg: str) -> None:
+    print(f"  WARN {msg}")
 
-def _matmul_flops(M: int, N: int, K: int) -> int:
-    """FLOPs for a single matmul C[M,N] = A[M,K] @ B[K,N]."""
-    return 2 * M * N * K
+def fail(msg: str) -> None:
+    print(f"  FAIL {msg}")
+    sys.exit(1)
 
-
-def _benchmark_fn(fn, *args, warmup: int = _WARMUP_ITERS, iters: int = _BENCH_ITERS):
-    """
-    Benchmark *fn* using CUDA events. Returns median latency in microseconds.
-    """
-    # Warmup
-    for _ in range(warmup):
-        fn(*args)
-    torch.cuda.synchronize()
-
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
-
-    torch.cuda.synchronize()
-    for i in range(iters):
-        start_events[i].record()
-        fn(*args)
-        end_events[i].record()
-    torch.cuda.synchronize()
-
-    times_ms = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-    times_ms.sort()
-    median_ms = times_ms[len(times_ms) // 2]
-    return median_ms * 1000.0  # convert to microseconds
-
-
-# ---------------------------------------------------------------------------
-# Step 1-4: Environment verification
-# ---------------------------------------------------------------------------
-
-def verify_environment() -> None:
-    """Print GPU specs, PyTorch version, Triton version. Exit on failure."""
-
-    print("=== AutoKernel Setup ===\n")
-
-    # -- CUDA & GPU --
-    if not torch.cuda.is_available():
-        print("ERROR: CUDA is not available. A CUDA-capable GPU is required.")
-        sys.exit(1)
-
-    device = torch.cuda.current_device()
-    gpu_name = torch.cuda.get_device_name(device)
-    props = torch.cuda.get_device_properties(device)
-    mem_gb = props.total_memory / (1024 ** 3)
-    sm_count = props.multi_processor_count
-    cc_major = props.major
-    cc_minor = props.minor
-
-    # Driver and CUDA runtime versions
-    # torch.version.cuda gives the CUDA toolkit version PyTorch was compiled with
-    cuda_version = torch.version.cuda or "unknown"
-
-    # nvidia-smi driver version -- fall back gracefully
-    driver_str = "unknown"
+def run(cmd: list[str], timeout: int = 30) -> tuple[int, str]:
+    # Augment PATH so /opt/rocm/bin tools work without shell init
+    env = os.environ.copy()
+    rocm_bin = "/opt/rocm/bin"
+    if rocm_bin not in env.get("PATH", "") and os.path.isdir(rocm_bin):
+        env["PATH"] = f"{rocm_bin}:{env.get('PATH', '')}"
     try:
-        import subprocess
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            driver_str = result.stdout.strip().split("\n")[0]
-    except Exception:
-        pass
-
-    print(f"GPU: {gpu_name}")
-    print(f"  Memory: {mem_gb:.1f} GB")
-    print(f"  SM Count: {sm_count}")
-    print(f"  Compute Capability: {cc_major}.{cc_minor}")
-    print(f"  Driver: {driver_str}")
-    print(f"  CUDA: {cuda_version}")
-    print()
-
-    # -- PyTorch --
-    print(f"PyTorch: {torch.__version__}")
-
-    # -- Triton --
-    try:
-        import triton
-        print(f"Triton: {triton.__version__}")
-    except ImportError:
-        print("ERROR: Triton is not installed. Install with: pip install triton")
-        sys.exit(1)
-
-    print()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except FileNotFoundError:
+        # Try absolute path under /opt/rocm/bin as fallback
+        if not cmd[0].startswith("/") and os.path.exists(f"/opt/rocm/bin/{cmd[0]}"):
+            return run([f"/opt/rocm/bin/{cmd[0]}"] + cmd[1:], timeout=timeout)
+        return 127, f"{cmd[0]} not found"
 
 
 # ---------------------------------------------------------------------------
-# Step 5-6: Generate & cache test data
+# Step 1: ROCm + GPU
 # ---------------------------------------------------------------------------
 
-def generate_test_data() -> None:
-    """Generate deterministic test tensors for all sizes and dtypes."""
+def check_rocm() -> dict:
+    step("ROCm + GPU detection")
+    rc, out = run(["rocminfo"], timeout=20)
+    if rc != 0:
+        fail(f"rocminfo failed (rc={rc}). Install ROCm.")
+    if "gfx942" not in out:
+        fail("rocminfo reports no gfx942 device. MI300X required.")
+    ok("rocminfo reports gfx942")
 
-    os.makedirs(TEST_DATA_DIR, exist_ok=True)
-    print("Generating test data...")
+    rc, out = run(["rocm-smi", "--showproductname"], timeout=10)
+    if rc != 0:
+        warn("rocm-smi not available; skipping GPU enumeration")
+        return {"num_gpus": 0}
+    # Count GPU lines
+    n_gpus = len(re.findall(r"GPU\[\d+\]\s*:", out))
+    if n_gpus == 0:
+        n_gpus = out.count("MI300X")
+    ok(f"detected {n_gpus} GPU(s) via rocm-smi")
+    if n_gpus < 8:
+        warn(f"expected 8 MI300X, found {n_gpus} -- launcher will scale to what's available")
 
-    gen = torch.Generator(device="cpu")
+    rc, out = run(["rocm-smi", "--showuse"], timeout=10)
+    if rc == 0:
+        busy = []
+        for m in re.finditer(r"GPU\[(\d+)\][^\n]*?(\d+)%", out):
+            gpu_id, pct = int(m.group(1)), int(m.group(2))
+            if pct > 5:
+                busy.append((gpu_id, pct))
+        if busy:
+            warn(f"GPUs in use: {busy} -- pin around them in launcher")
+        else:
+            ok("all GPUs idle")
 
-    for size_name, dims in MATMUL_SIZES:
-        M, N, K = dims["M"], dims["N"], dims["K"]
-        for dtype in TEST_DTYPES:
-            tag = _dtype_tag(dtype)
-            label = f"  matmul/{size_name}/{tag}"
-
-            save_dir = os.path.join(TEST_DATA_DIR, "matmul", size_name)
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, f"{tag}.pt")
-
-            if os.path.exists(save_path):
-                print(f"{label} ... cached")
-                continue
-
-            # Deterministic generation -- seed is fixed per (size, dtype) pair
-            gen.manual_seed(_SEED)
-            A = torch.randn(M, K, generator=gen, dtype=dtype)
-            B = torch.randn(K, N, generator=gen, dtype=dtype)
-
-            torch.save({"A": A, "B": B}, save_path)
-            print(f"{label} ... ok")
-
-    print()
+    return {"num_gpus": n_gpus}
 
 
 # ---------------------------------------------------------------------------
-# Step 7: Smoke test
+# Step 2: Repos
 # ---------------------------------------------------------------------------
 
-def smoke_test() -> None:
-    """Import kernel.py, run on tiny input, check correctness."""
+def check_repos() -> None:
+    step("Genesis / quadrants / newton-assets repos on host")
+    for name in ["Genesis", "quadrants", "newton-assets"]:
+        p = AUTOKERNEL_ROOT / name
+        if not p.is_dir():
+            fail(f"{p} not found. clone per prompt_mi300x.md§Setup.")
+        ok(f"{p} exists")
 
-    print("Smoke test...")
+    urdf = AUTOKERNEL_ROOT / "newton-assets" / "unitree_g1" / "urdf" / "g1_29dof.urdf"
+    if not urdf.exists():
+        fail(f"{urdf} missing")
+    ok("g1_29dof URDF present")
 
-    # Import kernel
-    try:
-        import kernel  # noqa: F401
-        print("  Import kernel.py: ok")
-    except Exception as e:
-        print(f"  Import kernel.py: FAIL ({e})")
-        sys.exit(1)
-
-    # Detect the kernel type from the module. Only run the full smoke test
-    # for matmul kernels -- other kernel types have different calling
-    # conventions and input shapes that we cannot generically test here.
-    kernel_type = getattr(kernel, "KERNEL_TYPE", None)
-    if kernel_type is None:
-        # Try to infer from module contents
-        try:
-            if hasattr(kernel, "kernel_fn"):
-                kernel_type = "unknown"
-            else:
-                kernel_type = "unknown"
-        except Exception:
-            kernel_type = "unknown"
-
-    if kernel_type != "matmul" and kernel_type != "unknown":
-        print(f"  Kernel type is '{kernel_type}' (not matmul) -- skipping matmul smoke test.")
-        print(f"  Smoke test: SKIP (kernel-type-specific smoke test not implemented)")
-        print()
-        return
-
-    if kernel_type != "matmul":
-        # kernel_type is "unknown" -- try the matmul smoke test but do not
-        # fail hard if the calling convention does not match.
-        print(f"  Kernel type not declared -- attempting matmul smoke test...")
-
-    # Import reference
-    try:
-        from reference import matmul_ref
-    except Exception as e:
-        print(f"  Import reference.py: FAIL ({e})")
-        sys.exit(1)
-
-    # Run kernel on tiny fp16 input
-    dtype = torch.float16
-    size_name = "tiny"
-    dims = dict(MATMUL_SIZES)[size_name]
-    M, N, K = dims["M"], dims["N"], dims["K"]
-
-    gen = torch.Generator(device="cpu")
-    gen.manual_seed(_SEED)
-    A = torch.randn(M, K, generator=gen, dtype=dtype).cuda()
-    B = torch.randn(K, N, generator=gen, dtype=dtype).cuda()
-
-    try:
-        C_kernel = kernel.kernel_fn(A, B)
-        torch.cuda.synchronize()
-        print(f"  Run kernel (tiny, fp16): ok")
-    except Exception as e:
-        if kernel_type == "unknown":
-            print(f"  Run kernel (tiny, fp16): SKIP (not a matmul kernel? error: {e})")
-            print()
-            return
-        print(f"  Run kernel (tiny, fp16): FAIL ({e})")
-        sys.exit(1)
-
-    # Correctness check
-    C_ref = matmul_ref(A, B)
-    torch.cuda.synchronize()
-
-    # For fp16 matmul, use relaxed tolerance
-    atol = 1e-2
-    rtol = 1e-2
-    if torch.allclose(C_kernel, C_ref, atol=atol, rtol=rtol):
-        print("  Correctness check: PASS")
+    # benchmark_scaling.py inside Genesis
+    bench = AUTOKERNEL_ROOT / "Genesis" / "benchmark_scaling.py"
+    if not bench.exists():
+        # Maybe lives outside Genesis at ~/work/benchmark_scaling.py
+        alt = AUTOKERNEL_ROOT / "benchmark_scaling.py"
+        if not alt.exists():
+            fail("benchmark_scaling.py not found in ~/work/Genesis or ~/work")
+        warn(f"benchmark_scaling.py found at {alt}, not in Genesis -- copy it into Genesis before bench")
     else:
-        max_diff = (C_kernel - C_ref).abs().max().item()
-        print(f"  Correctness check: FAIL (max diff = {max_diff:.6f}, atol={atol}, rtol={rtol})")
-        # Don't exit -- let the user decide
-
-    print()
+        ok("Genesis/benchmark_scaling.py present")
 
 
 # ---------------------------------------------------------------------------
-# Step 8: Benchmark PyTorch baselines
+# Step 3: Docker image
 # ---------------------------------------------------------------------------
 
-def benchmark_baselines() -> dict:
-    """Benchmark torch.matmul at all sizes and dtypes. Returns results dict."""
+def check_docker_image(image: str) -> None:
+    step(f"Docker image: {image}")
+    rc, out = run(["docker", "image", "inspect", image], timeout=15)
+    if rc != 0:
+        fail(f"image {image} not found locally. Build per prompt_mi300x.md§Build:\n"
+             "  cd ~/work/quadrants && docker buildx build -f Dockerfile.rocm -t quadrants:amd-integration .\n"
+             "  cd ~/work/Genesis   && docker buildx build -f Dockerfile.rocm -t genesis:amd-integration .\n"
+             "OR pass --existing-container <name> to reuse a running container with Genesis+Quadrants installed.")
+    ok(f"image {image} present")
 
-    print("Benchmarking PyTorch baselines...")
-    results = {}
 
-    for size_name, dims in MATMUL_SIZES:
-        M, N, K = dims["M"], dims["N"], dims["K"]
-        flops = _matmul_flops(M, N, K)
+def check_existing_container(name: str) -> None:
+    step(f"Existing container: {name}")
+    rc, out = run(["docker", "inspect", "-f", "{{.State.Running}}", name], timeout=10)
+    if rc != 0 or out.strip() != "true":
+        fail(f"container {name} is not running. `docker ps -a | grep {name}` to investigate.")
+    ok(f"container {name} is running")
+    # Sanity: can it import genesis + quadrants?
+    rc, out = run(
+        ["docker", "exec", name, "python3", "-c",
+         "import genesis as gs; import quadrants as qd; print('genesis_ok')"],
+        timeout=30,
+    )
+    if rc != 0 or "genesis_ok" not in out:
+        fail(f"container {name} cannot import genesis+quadrants:\n{out[-500:]}")
+    ok(f"container {name} can import genesis + quadrants")
 
-        for dtype in TEST_DTYPES:
-            tag = _dtype_tag(dtype)
 
-            # Load cached test data if available, else generate on the fly
-            save_path = os.path.join(TEST_DATA_DIR, "matmul", size_name, f"{tag}.pt")
-            if os.path.exists(save_path):
-                data = torch.load(save_path, weights_only=True)
-                A = data["A"].cuda()
-                B = data["B"].cuda()
-            else:
-                gen = torch.Generator(device="cpu")
-                gen.manual_seed(_SEED)
-                A = torch.randn(M, K, generator=gen, dtype=dtype).cuda()
-                B = torch.randn(K, N, generator=gen, dtype=dtype).cuda()
+# ---------------------------------------------------------------------------
+# Step 4: Baseline + variance calibration
+# ---------------------------------------------------------------------------
 
-            latency_us = _benchmark_fn(torch.matmul, A, B)
-            tflops = flops / (latency_us * 1e-6) / 1e12
+def baseline_calibration(image: str, container_name: str, n_trials: int) -> dict:
+    step(f"Baseline + variance calibration ({n_trials} trials, GPU 0)")
 
-            key = f"matmul_{size_name}_{tag}"
-            results[key] = {
-                "kernel_type": "matmul",
-                "size": size_name,
-                "dtype": tag,
-                "M": M, "N": N, "K": K,
-                "latency_us": round(latency_us, 2),
-                "throughput_tflops": round(tflops, 3),
-            }
+    # Spin up a temp container
+    rc, _ = run(["docker", "rm", "-f", container_name], timeout=15)  # cleanup if leftover
+    cmd = [
+        "docker", "run", "-d", "--rm",
+        "--device=/dev/kfd", "--device=/dev/dri",
+        "--group-add", "video", "--group-add", "render",
+        "--security-opt", "seccomp=unconfined", "--ipc=host", "--shm-size", "32G",
+        "--name", container_name,
+        "-e", "HIP_VISIBLE_DEVICES=0",
+        "-e", "GS_FAST_MATH=0",
+        "-e", "PYOPENGL_PLATFORM=egl", "-e", "EGL_PLATFORM=surfaceless",
+        "-e", "PYGLET_HEADLESS=true",
+        "-v", f"{AUTOKERNEL_ROOT / 'Genesis'}:/src/Genesis",
+        "-v", f"{AUTOKERNEL_ROOT / 'quadrants'}:/src/quadrants:ro",
+        "-v", f"{AUTOKERNEL_ROOT / 'newton-assets'}:/src/newton-assets:ro",
+        image, "sleep", "infinity",
+    ]
+    rc, out = run(cmd, timeout=60)
+    if rc != 0:
+        fail(f"docker run failed: {out[:500]}")
+    ok(f"container {container_name} up")
 
-            print(f"  matmul {size_name} {tag}: {tflops:.1f} TFLOPS ({latency_us:.2f} us)")
+    try:
+        # Genesis sometimes wants newton-assets as a sibling symlink
+        run(["docker", "exec", container_name, "bash", "-lc",
+             "ln -sfn /src/newton-assets /src/Genesis/newton-assets || true"], timeout=10)
 
-            # Free GPU memory
-            del A, B
-            torch.cuda.empty_cache()
+        results = []
+        for trial in range(n_trials):
+            print(f"  trial {trial+1}/{n_trials} (cache wipe + benchmark_scaling.py 8192/500/FP32)...")
+            wipe = "rm -rf /root/.cache/quadrants /root/.cache/mesa_shader_cache 2>/dev/null; true"
+            run(["docker", "exec", container_name, "bash", "-lc", wipe], timeout=30)
+            t0 = time.time()
+            cmd = (
+                "cd /src/Genesis && "
+                "python benchmark_scaling.py --precision 32 --max-envs 8192 --num-steps 500 "
+                "--scaling-results-out /tmp/baseline.json 2>&1 | tail -5"
+            )
+            rc, out = run(["docker", "exec", container_name, "bash", "-lc", cmd], timeout=900)
+            dt = time.time() - t0
+            if rc != 0:
+                warn(f"trial {trial+1} failed: {out[-400:]}")
+                continue
+            rc2, raw = run(["docker", "exec", container_name, "cat", "/tmp/baseline.json"], timeout=10)
+            if rc2 != 0:
+                warn(f"trial {trial+1}: could not read baseline JSON")
+                continue
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                warn(f"trial {trial+1}: malformed JSON")
+                continue
+            entry = parsed if isinstance(parsed, dict) else (parsed[-1] if parsed else None)
+            if not entry:
+                continue
+            thr = entry.get("throughput") or entry.get("env_steps_per_sec") or 0.0
+            wall = entry.get("wall_time_s") or entry.get("wall") or dt
+            ok(f"trial {trial+1}: {thr:.0f} env*steps/s, wall {wall:.2f}s")
+            results.append({"throughput": float(thr), "wall_seconds": float(wall)})
+    finally:
+        run(["docker", "rm", "-f", container_name], timeout=20)
+
+    if len(results) < 2:
+        warn("fewer than 2 successful trials -- noise floor will default to 1.0%")
+        return {"trials": results, "e2e_noise_floor_pct": 1.0,
+                "median_throughput": results[0]["throughput"] if results else None}
+
+    throughputs = [r["throughput"] for r in results]
+    median = statistics.median(throughputs)
+    stdev = statistics.stdev(throughputs)
+    cv_pct = 100.0 * stdev / median if median else 0.0
+    # Noise floor = max(1.0%, 3*sigma_pct) per design discussion
+    noise_floor = max(1.0, 3.0 * cv_pct)
 
     print()
-    return results
+    print(f"  baseline median throughput: {median:.0f} env*steps/s")
+    print(f"  stdev:                      {stdev:.1f}")
+    print(f"  coefficient of variation:   {cv_pct:.2f}%")
+    print(f"  computed noise floor:       {noise_floor:.2f}% (max of 1.0%, 3*sigma)")
+    return {
+        "trials": results,
+        "median_throughput": median,
+        "stdev": stdev,
+        "cv_pct": cv_pct,
+        "e2e_noise_floor_pct": noise_floor,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Plan
+# ---------------------------------------------------------------------------
+
+def write_plan(noise_pct: float, baseline_throughput: float | None) -> None:
+    step("Writing workspace/orchestration_state.json from kernel manifests")
+    WORKSPACE.mkdir(exist_ok=True)
+    campaigns = []
+    for d in sorted(KERNELS.iterdir()):
+        if not d.is_dir():
+            continue
+        manifest_path = d / "target.json"
+        if not manifest_path.exists():
+            continue
+        with open(manifest_path) as f:
+            m = json.load(f)
+        campaigns.append({
+            "campaign_id": m["campaign_id"],
+            "current_pct_of_h100": m["current_pct_of_h100"],
+            "target_pct_of_h100": m.get("target_pct_of_h100", 80.0),
+            "baseline_kernel_avg_us": m.get("baseline_kernel_avg_us"),
+            "current_kernel_avg_us": m.get("baseline_kernel_avg_us"),
+            "best_kernel_avg_us": m.get("baseline_kernel_avg_us"),
+            "best_e2e_throughput": baseline_throughput,
+            "experiments_run": 0,
+            "consecutive_reverts": 0,
+            "status": "pending",
+        })
+        ok(f"loaded campaign {m['campaign_id']}")
+
+    state = {
+        "noise_floor_pct": noise_pct,
+        "baseline_e2e_throughput": baseline_throughput,
+        "h100_throughput_ref": 794280.0,
+        "campaigns": campaigns,
+        "move_on_criteria": {
+            "consecutive_reverts": 8,
+            "max_experiments_per_campaign": 80,
+            "kernel_pct_target": 80.0,
+        },
+    }
+    out = WORKSPACE / "orchestration_state.json"
+    with open(out, "w") as f:
+        json.dump(state, f, indent=2)
+    ok(f"wrote {out}")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    # Step 1-4: Verify environment
-    verify_environment()
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--skip-baseline", action="store_true",
+                    help="skip the 3-trial baseline calibration")
+    ap.add_argument("--image", default="genesis:amd-integration",
+                    help="docker image to use for baseline (ignored if --existing-container set)")
+    ap.add_argument("--container-name", default="ak-prepare",
+                    help="temp container name for baseline (only used when spinning a fresh image)")
+    ap.add_argument("--existing-container", default=None,
+                    help="reuse an already-running container with genesis+quadrants installed (e.g. 'gbench')")
+    ap.add_argument("--n-trials", type=int, default=3,
+                    help="number of baseline trials for variance estimation")
+    args = ap.parse_args()
 
-    # Step 5: Create cache directories
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    os.makedirs(TEST_DATA_DIR, exist_ok=True)
+    check_rocm()
+    check_repos()
+    if args.existing_container:
+        check_existing_container(args.existing_container)
+    else:
+        check_docker_image(args.image)
 
-    # Step 6: Generate test data
-    generate_test_data()
+    if args.skip_baseline:
+        warn("--skip-baseline: noise floor defaults to 1.0%")
+        cal = {"e2e_noise_floor_pct": 1.0, "median_throughput": None}
+    else:
+        cal = baseline_calibration(args.image, args.container_name, args.n_trials)
+        # Save calibration as its own file for the agent to read
+        WORKSPACE.mkdir(exist_ok=True)
+        with open(WORKSPACE / "baseline_calibration.json", "w") as f:
+            json.dump(cal, f, indent=2)
+        ok(f"wrote {WORKSPACE / 'baseline_calibration.json'}")
 
-    # Step 7: Smoke test
-    smoke_test()
+    write_plan(cal["e2e_noise_floor_pct"], cal.get("median_throughput"))
 
-    # Step 8: Benchmark baselines
-    baselines = benchmark_baselines()
-
-    # Save baselines
-    with open(BASELINES_PATH, "w") as f:
-        json.dump(baselines, f, indent=2)
-    print(f"Baselines saved to {BASELINES_PATH}")
-
-    # Step 9: Summary
     print()
-    print("Ready to run experiments!")
+    print("Ready. Next steps:")
+    print("  - Run launcher/launch_8gpu.sh to spawn 8 per-GPU containers + worktrees")
+    print("  - Or smoke-test: HIP_VISIBLE_DEVICES=0 GENESIS_SRC=$HOME/work/Genesis \\")
+    print("                   AUTOKERNEL_GPU_ID=0 AUTOKERNEL_CONTAINER=ak-gpu0 \\")
+    print("                   uv run bench.py --campaign func_broad_phase")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
