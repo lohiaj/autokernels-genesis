@@ -227,7 +227,7 @@ def run_traced_bench(out_dir: str) -> dict:
         f"GS_FAST_MATH=0 "
         f"PYOPENGL_PLATFORM=egl EGL_PLATFORM=surfaceless PYGLET_HEADLESS=true "
         f"timeout {TRACED_TIMEOUT_S - 60} "
-        f"rocprofv3 --stats --kernel-trace -d . -o traced -- "
+        f"rocprofv3 --stats --kernel-trace -f csv -d . -o traced -- "
         f"python3 /work/bench_mi300.py "
         f"--precision {DEFAULT_PRECISION} "
         f"--n-envs {DEFAULT_NENVS} "
