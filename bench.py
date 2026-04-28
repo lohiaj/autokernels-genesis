@@ -46,22 +46,24 @@ import sys
 import time
 from pathlib import Path
 
+from _config import cfg
+
 # ---------------------------------------------------------------------------
-# Constants
+# Constants (sourced from harness.toml via _config.cfg)
 # ---------------------------------------------------------------------------
 
-H100_THROUGHPUT_REF = 794280.0   # env*steps/s, from references/project_context.md
-DEFAULT_E2E_NSTEPS = 500         # untraced (headline)
-DEFAULT_PROF_NSTEPS = 100        # traced (per-kernel attribution; rocprofv3 has ~30% overhead)
-DEFAULT_NENVS = 8192
-DEFAULT_PRECISION = "32"
+H100_THROUGHPUT_REF = cfg.get_reference_value()       # back-compat alias
+DEFAULT_E2E_NSTEPS  = cfg.get_default_e2e_nsteps()
+DEFAULT_PROF_NSTEPS = cfg.get_default_prof_nsteps()
+DEFAULT_NENVS       = cfg.get_default_n_envs()
+DEFAULT_PRECISION   = cfg.get_default_precision()
+DEFAULT_TRIALS      = cfg.get_default_trials()
 
-UNTRACED_TIMEOUT_S = 600         # 10 min hard ceiling for untraced bench
-TRACED_TIMEOUT_S = 900           # 15 min for traced (slower, more steps in profile mode)
-CORRECTNESS_TIMEOUT_S = 600      # 10 min for scoped pytest
-DEFAULT_TRIALS = 3               # untraced trials per bench (mean + stdev)
+UNTRACED_TIMEOUT_S    = cfg.get_untraced_timeout_s()
+TRACED_TIMEOUT_S      = cfg.get_traced_timeout_s()
+CORRECTNESS_TIMEOUT_S = cfg.get_correctness_timeout_s()
 
-EXCLUDE_KERNEL_RE = re.compile(r"runtime_initialize_rand_states")
+EXCLUDE_KERNEL_RE = re.compile(cfg.get_exclude_kernel_re())
 
 # Campaign manifest path relative to repo root
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -150,16 +152,12 @@ def check_rubric_or_die(skip: bool) -> None:
 def _container() -> str:
     name = os.environ.get("AUTOKERNEL_CONTAINER")
     if not name:
-        # Default per-GPU naming if not set explicitly
         gpu = os.environ.get("AUTOKERNEL_GPU_ID", "0")
-        name = f"ak-gpu{gpu}"
+        name = cfg.get_container_name(gpu)
     return name
 
 def _genesis_src() -> str:
-    src = os.environ.get("GENESIS_SRC")
-    if not src:
-        src = os.path.expanduser("~/work/Genesis")
-    return src
+    return os.environ.get("GENESIS_SRC") or cfg.get_project_src_default()
 
 def _docker_exec(cmd: str, timeout: int) -> tuple[int, str]:
     """Run `cmd` inside the container. Returns (returncode, combined_stdout_stderr)."""
@@ -209,13 +207,15 @@ def verify_edit_files_exist(manifest: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def wipe_caches() -> None:
-    """Wipe Quadrants and Mesa kernel caches inside the container.
+    """Wipe project-specific kernel caches inside the container.
 
-    Per references/project_context.md: every Genesis edit requires this or the cached compiled kernel
-    is reused and the patch silently no-ops.
+    Caches that survive an edit will silently no-op the patch (the JIT serves
+    the previous compiled kernel). The list of paths to wipe is configured in
+    harness.toml::container.caches_to_wipe.
     """
+    paths = " ".join(shlex.quote(p) for p in cfg.get_caches_to_wipe())
     rc, out = _docker_exec(
-        "rm -rf /root/.cache/quadrants /root/.cache/mesa_shader_cache 2>/dev/null; true",
+        f"rm -rf {paths} 2>/dev/null; true",
         timeout=60,
     )
     if rc != 0:
@@ -232,27 +232,21 @@ def wipe_caches() -> None:
 # (e.g., dev box without root inside container).
 
 def pin_gpu_clocks() -> str | None:
-    """Pin the agent's GPU to perf level 'high'. Returns the previous level
-    string for restore, or None if pinning failed (operation is best-effort)."""
+    """Pin the agent's GPU to high perf level. Returns previous level for
+    restore, or None if pinning failed (best-effort; commands are configurable
+    via harness.toml::gpu)."""
     gpu = os.environ.get("AUTOKERNEL_GPU_ID", "0")
-    # Read current level (parse rocm-smi --showperflevel output)
-    rc, out = _docker_exec(
-        f"rocm-smi -d {gpu} --showperflevel 2>&1 || true",
-        timeout=15,
-    )
+    rc, out = _docker_exec(f"{cfg.get_gpu_read_perf_command(gpu)} 2>&1 || true", timeout=15)
     prev = None
     if rc == 0:
-        m = re.search(r"Performance Level[^:]*:\s*(\w+)", out)
+        m = re.search(cfg.get_prev_level_regex(), out)
         if m:
             prev = m.group(1)
-    rc2, out2 = _docker_exec(
-        f"rocm-smi -d {gpu} --setperflevel high 2>&1 || true",
-        timeout=15,
-    )
+    rc2, out2 = _docker_exec(f"{cfg.get_gpu_pin_command(gpu)} 2>&1 || true", timeout=15)
     if rc2 == 0 and "ERROR" not in out2.upper() and "Permission" not in out2:
         print(f"bench: pinned GPU{gpu} clocks to 'high' (was '{prev or 'unknown'}')")
         return prev or "auto"
-    warn(f"could not pin GPU{gpu} clocks (rocm-smi unavailable or no permission); "
+    warn(f"could not pin GPU{gpu} clocks (perf-control tool unavailable or no permission); "
          f"trial variance may be elevated")
     return None
 
@@ -262,25 +256,23 @@ def restore_gpu_clocks(prev: str | None) -> None:
     if prev is None:
         return
     gpu = os.environ.get("AUTOKERNEL_GPU_ID", "0")
-    _docker_exec(
-        f"rocm-smi -d {gpu} --setperflevel {prev} 2>&1 || true",
-        timeout=15,
-    )
+    _docker_exec(f"{cfg.get_gpu_restore_command(gpu, prev)} 2>&1 || true", timeout=15)
     print(f"bench: restored GPU{gpu} perf level to '{prev}'")
 
 
 def run_correctness(manifest: dict) -> tuple[str, str]:
-    """Run the scoped pytest subset. Returns (status, log_tail)."""
+    """Run the scoped pytest subset. Returns (status, log_tail).
+
+    cwd, env vars, and pytest flags are all configured in harness.toml::correctness.
+    """
     tests = manifest["correctness_tests"]
     if not tests:
         return "SKIP", "no correctness_tests listed"
     test_args = " ".join(shlex.quote(t) for t in tests)
-    # Match team's flags: -v -n 0 --forked -m required (per dev guidelines)
-    # Keep the output captured but small.
     cmd = (
-        f"cd /src/Genesis && "
-        f"GS_FAST_MATH=0 timeout {CORRECTNESS_TIMEOUT_S - 30} "
-        f"python -m pytest {test_args} -v -n 0 --forked -m required 2>&1 | tail -200"
+        f"cd {cfg.get_pytest_dir()} && "
+        f"{cfg.get_pytest_extra_env()} timeout {CORRECTNESS_TIMEOUT_S - 30} "
+        f"python -m pytest {test_args} {cfg.get_pytest_args()} 2>&1 | tail -200"
     )
     rc, out = _docker_exec(cmd, timeout=CORRECTNESS_TIMEOUT_S)
     if rc == 124:
@@ -297,10 +289,9 @@ def _run_untraced_trial(out_dir: str, trial_idx: int) -> dict:
     json_out = f"{out_dir}/untraced_t{trial_idx}.json"
     cmd = (
         f"mkdir -p {out_dir} && "
-        f"GS_FAST_MATH=0 "
-        f"PYOPENGL_PLATFORM=egl EGL_PLATFORM=surfaceless PYGLET_HEADLESS=true "
+        f"{cfg.get_container_env_str()} "
         f"timeout {UNTRACED_TIMEOUT_S - 30} "
-        f"python3 /work/bench_mi300.py "
+        f"python3 {cfg.get_bench_script()} "
         f"--precision {DEFAULT_PRECISION} "
         f"--n-envs {DEFAULT_NENVS} "
         f"--num-steps {DEFAULT_E2E_NSTEPS} "
@@ -325,8 +316,8 @@ def _run_untraced_trial(out_dir: str, trial_idx: int) -> dict:
         return {"status": "PARSE_FAIL", "wall_seconds": dt, "log_tail": out[-800:],
                 "raw": str(parsed)[:400]}
 
-    throughput = entry.get("throughput") or entry.get("env_steps_per_sec") or 0.0
-    wall = entry.get("wall_time_s") or entry.get("wall") or 0.0
+    throughput = _first_present(entry, cfg.get_metric_json_keys()) or 0.0
+    wall       = _first_present(entry, cfg.get_wall_json_keys()) or 0.0
     return {
         "status": "PASS",
         "e2e_throughput": float(throughput),
@@ -394,14 +385,13 @@ def run_untraced_bench(out_dir: str, n_trials: int = DEFAULT_TRIALS,
 
 
 def run_traced_bench(out_dir: str) -> dict:
-    """Run benchmark under rocprofv3 for per-kernel attribution."""
+    """Run benchmark under the configured profiler for per-kernel attribution."""
     cmd = (
         f"mkdir -p {out_dir} && cd {out_dir} && "
-        f"GS_FAST_MATH=0 "
-        f"PYOPENGL_PLATFORM=egl EGL_PLATFORM=surfaceless PYGLET_HEADLESS=true "
+        f"{cfg.get_container_env_str()} "
         f"timeout {TRACED_TIMEOUT_S - 60} "
-        f"rocprofv3 --stats --kernel-trace -f csv -d . -o traced -- "
-        f"python3 /work/bench_mi300.py "
+        f"{cfg.get_profiler_command()} "
+        f"python3 {cfg.get_bench_script()} "
         f"--precision {DEFAULT_PRECISION} "
         f"--n-envs {DEFAULT_NENVS} "
         f"--num-steps {DEFAULT_PROF_NSTEPS} "
@@ -417,7 +407,8 @@ def run_traced_bench(out_dir: str) -> dict:
     if rc != 0:
         return {"status": "CRASH", "wall_seconds": dt, "log_tail": out[-1500:]}
 
-    return {"status": "PASS", "wall_seconds": dt, "csv_path": f"{out_dir}/traced_kernel_stats.csv"}
+    csv_name = "traced" + cfg.get_stats_csv_suffix()  # e.g. "traced_kernel_stats.csv"
+    return {"status": "PASS", "wall_seconds": dt, "csv_path": f"{out_dir}/{csv_name}"}
 
 
 def parse_kernel_stats(csv_path: str, pattern: str) -> dict:
@@ -488,6 +479,17 @@ def parse_kernel_stats(csv_path: str, pattern: str) -> dict:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _first_present(d: dict, keys: list[str]) -> object | None:
+    """Return the first non-falsy value from `d` for any of `keys`. Used for
+    extracting metric/wall fields from bench-script JSON without hardcoding key
+    names (different bench scripts use different conventions)."""
+    for k in keys:
+        v = d.get(k)
+        if v:
+            return v
+    return None
+
+
 def _read_json_in_container(path: str) -> object | None:
     rc, content = _docker_exec(f"cat {path} 2>&1", timeout=30)
     if rc != 0:
@@ -557,7 +559,10 @@ def print_contract(*, correctness: str, kernel_avg_us: float, kernel_total_ms: f
     print(f"e2e_throughput_sigma: {e2e_throughput_sigma:.1f}")
     print(f"e2e_throughput_sigma_pct: {e2e_throughput_sigma_pct:.3f}")
     print(f"e2e_throughput_n:   {e2e_throughput_n}")
-    pct = (100.0 * e2e_throughput / H100_THROUGHPUT_REF) if H100_THROUGHPUT_REF else 0.0
+    ref = cfg.get_reference_value()
+    pct = (100.0 * e2e_throughput / ref) if ref else 0.0
+    # Key is kept as e2e_pct_of_h100 for back-compat with existing parsers /
+    # results.tsv schema; the value is "% of whatever reference_value is set to".
     print(f"e2e_pct_of_h100:    {pct:.2f}")
     print(f"e2e_wall_seconds:   {e2e_wall_seconds:.3f}")
     print(f"peak_vram_mb:       {peak_vram_mb:.1f}")
@@ -634,9 +639,10 @@ def main() -> int:
             )
             return 0
 
-    # Make a per-experiment workspace dir inside the container (mounted at /work/runs/<id>)
+    # Make a per-experiment workspace dir inside the container.
+    # runs_dir is configured in harness.toml::container.runs_dir.
     run_id = time.strftime("%Y%m%d-%H%M%S")
-    out_dir_in_container = f"/work/runs/{args.campaign}-{run_id}"
+    out_dir_in_container = f"{cfg.get_runs_dir()}/{args.campaign}-{run_id}"
 
     # Step 3: untraced bench (headline e2e) -- N trials for variance estimate.
     # Pin GPU clocks for the duration of the WHOLE bench (untraced + traced) to

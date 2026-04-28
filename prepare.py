@@ -29,6 +29,8 @@ import sys
 import time
 from pathlib import Path
 
+from _config import cfg
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE = SCRIPT_DIR / "workspace"
 KERNELS = SCRIPT_DIR / "kernels"
@@ -75,9 +77,10 @@ def check_rocm() -> dict:
     rc, out = run(["rocminfo"], timeout=20)
     if rc != 0:
         fail(f"rocminfo failed (rc={rc}). Install ROCm.")
-    if "gfx942" not in out:
-        fail("rocminfo reports no gfx942 device. MI300X required.")
-    ok("rocminfo reports gfx942")
+    arch = cfg.get_gpu_arch()
+    if arch not in out:
+        fail(f"rocminfo reports no {arch} device. (Configured GPU arch in harness.toml::host.gpu_arch)")
+    ok(f"rocminfo reports {arch}")
 
     rc, out = run(["rocm-smi", "--showproductname"], timeout=10)
     if rc != 0:
@@ -111,28 +114,30 @@ def check_rocm() -> dict:
 # ---------------------------------------------------------------------------
 
 def check_repos() -> None:
-    step("Genesis / quadrants / newton-assets repos on host")
-    for name in ["Genesis", "quadrants", "newton-assets"]:
-        p = AUTOKERNEL_ROOT / name
+    step("Required host directories")
+    for p_str in cfg.get_required_dirs():
+        p = Path(p_str)
         if not p.is_dir():
-            fail(f"{p} not found. clone per prompt_mi300x.md§Setup.")
+            fail(f"{p} not found (configured in harness.toml::host.required_dirs).")
         ok(f"{p} exists")
 
+    # Genesis-specific files (URDF + benchmark_scaling.py). These live in the
+    # Genesis tree itself and are project-specific, not harness-level. Soft
+    # warnings only -- a harness retargeted at a non-Genesis project shouldn't
+    # be blocked by missing Genesis assets.
     urdf = AUTOKERNEL_ROOT / "newton-assets" / "unitree_g1" / "urdf" / "g1_29dof.urdf"
-    if not urdf.exists():
-        fail(f"{urdf} missing")
-    ok("g1_29dof URDF present")
-
-    # benchmark_scaling.py inside Genesis
-    bench = AUTOKERNEL_ROOT / "Genesis" / "benchmark_scaling.py"
-    if not bench.exists():
-        # Maybe lives outside Genesis at ~/work/benchmark_scaling.py
-        alt = AUTOKERNEL_ROOT / "benchmark_scaling.py"
-        if not alt.exists():
-            fail("benchmark_scaling.py not found in ~/work/Genesis or ~/work")
-        warn(f"benchmark_scaling.py found at {alt}, not in Genesis -- copy it into Genesis before bench")
+    if urdf.exists():
+        ok("g1_29dof URDF present")
     else:
+        warn(f"{urdf} missing (Genesis-specific; ignore if targeting a non-Genesis project)")
+
+    bench = AUTOKERNEL_ROOT / "Genesis" / "benchmark_scaling.py"
+    if bench.exists():
         ok("Genesis/benchmark_scaling.py present")
+    elif (AUTOKERNEL_ROOT / "benchmark_scaling.py").exists():
+        warn(f"benchmark_scaling.py at {AUTOKERNEL_ROOT / 'benchmark_scaling.py'}, not in Genesis -- copy it in before bench")
+    else:
+        warn("benchmark_scaling.py not found in Genesis tree (Genesis-specific; ignore if retargeted)")
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +300,7 @@ def write_plan(noise_pct: float, baseline_throughput: float | None) -> None:
     state = {
         "noise_floor_pct": noise_pct,
         "baseline_e2e_throughput": baseline_throughput,
-        "h100_throughput_ref": 794280.0,
+        "h100_throughput_ref": cfg.get_reference_value(),
         "campaigns": campaigns,
         # Soft advisory thresholds. As of the loop redesign, these no longer
         # cause `orchestrate.py next` to return DONE -- they only emit warnings
@@ -321,8 +326,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-baseline", action="store_true",
                     help="skip the 3-trial baseline calibration")
-    ap.add_argument("--image", default="genesis:amd-integration",
-                    help="docker image to use for baseline (ignored if --existing-container set)")
+    ap.add_argument("--image", default=cfg.get_container_image(),
+                    help="docker image to use for baseline (default from harness.toml::container.image; "
+                         "ignored if --existing-container set)")
     ap.add_argument("--container-name", default="ak-prepare",
                     help="temp container name for baseline (only used when spinning a fresh image)")
     ap.add_argument("--existing-container", default=None,

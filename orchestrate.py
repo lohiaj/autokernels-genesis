@@ -27,10 +27,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from _config import cfg
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE = SCRIPT_DIR / "workspace"
 STATE_PATH = WORKSPACE / "orchestration_state.json"
-H100_REF = 794280.0
+H100_REF = cfg.get_reference_value()
 
 
 def load_state() -> dict:
@@ -67,7 +69,7 @@ def cmd_status(state: dict) -> None:
     print(f"orchestrator state ({STATE_PATH})")
     print(f"  noise_floor_pct: {state.get('noise_floor_pct')}")
     print(f"  baseline_e2e_throughput: {state.get('baseline_e2e_throughput')}")
-    print(f"  H100 reference: {H100_REF:.0f} env*steps/s")
+    print(f"  {cfg.get_reference_label()} reference: {H100_REF:.0f} {cfg.get_metric_unit()}")
     print()
     print("campaigns:")
     for c in state["campaigns"]:
@@ -205,7 +207,7 @@ def cmd_report(state: dict) -> None:
     lines.append("")
     lines.append(f"_generated {datetime.utcnow().isoformat()}Z_")
     lines.append("")
-    lines.append(f"H100 reference: {H100_REF:.0f} env*steps/s")
+    lines.append(f"{cfg.get_reference_label()} reference: {H100_REF:.0f} {cfg.get_metric_unit()}")
     lines.append(f"Baseline e2e (pre-run): {state.get('baseline_e2e_throughput')}")
     lines.append("")
     lines.append("## Campaign results")

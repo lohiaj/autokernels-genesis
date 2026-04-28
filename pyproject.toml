@@ -9,4 +9,6 @@ dependencies = [
     "matplotlib>=3.10.0",
     "numpy>=2.0.0",
     "pandas>=2.0.0",
+    # TOML loader for harness.toml -- stdlib (`tomllib`) on 3.11+, pip on 3.10.
+    "tomli>=2.0.0; python_version<'3.11'",
 ]

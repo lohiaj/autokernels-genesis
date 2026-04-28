@@ -186,6 +186,21 @@ The 2σ KEEP rule lives in `program.md::B2`. The static noise floor and per-camp
 | `correctness: FAIL` on baseline | Pre-existing breakage on the Genesis branch | Stop, fix the branch state out-of-band; do not let agent iterate on a broken baseline |
 | Sigma_pct > 5% on multi-trial | GPU clocks not pinned (rocm-smi unavailable, no permission) | Run container with `--privileged` or grant cap_sys_rawio |
 
+## Retargeting to a different project
+
+Every project- and platform-specific value lives in [`harness.toml`](harness.toml). Editing this file is sufficient to point the harness at a different ROCm project (e.g. Composable Kernel benchmarks, AITER) or a different GPU (replace clock-pin commands, profiler invocation, gpu_arch). The Python harness reads the file once at import time via `_config.py`; if the file is missing, the loader falls back to built-in Genesis-on-MI300X defaults.
+
+What's still per-project after editing `harness.toml`:
+
+- `kernels/<campaign>/{target.json,playbook.md}` — per-campaign edit-file scope, baselines, seed ideas.
+- `references/{project_context.md,mi300x_notes.md}` — the reference docs the agent reads at setup. Replace with your project's context + your GPU's hardware notes.
+- `program.md` — the operating manual. Most of it is generic (loop structure, KEEP rule, never-stop semantics); the campaign list at the top and a few project name mentions need updating.
+
+What's NOT yet abstracted (Layer 2+ work, not yet shipped):
+
+- Per-campaign hypothesis classification regex (currently hardcoded in `summarize.py` + `global_log.py` for Genesis DSL idioms — block_dim, fuse, hoist, vec3, AABB, LDS, AGPR, ...).
+- Some Genesis-specific guidance in `program.md` (campaign names, references to `qd.kernel`/`qd.func`, etc.).
+
 ## Files the agent must NEVER modify
 
 The harness and contract are frozen. The agent edits only files listed under `kernels/$CAMPAIGN/target.json::edit_files`. See `program.md::Hard constraints` for the full list.

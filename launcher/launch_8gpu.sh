@@ -12,7 +12,6 @@
 
 set -euo pipefail
 
-IMAGE="genesis:amd-integration"
 NUM_GPUS=8
 N_BROAD=4   # default split
 N_STEP=4
@@ -21,6 +20,25 @@ AK_REPO="${AK_REPO:-$AUTOKERNEL_ROOT/autokernels-genesis}"
 GENESIS_REPO="${GENESIS_REPO:-$AUTOKERNEL_ROOT/Genesis}"
 QUADRANTS_REPO="${QUADRANTS_REPO:-$AUTOKERNEL_ROOT/quadrants}"
 NEWTON_ASSETS="${NEWTON_ASSETS:-$AUTOKERNEL_ROOT/newton-assets}"
+
+# Default Docker image is sourced from harness.toml::container.image; --image
+# on the CLI overrides. Falls back if no TOML parser available.
+IMAGE_FROM_TOML="$(python3 -c '
+import sys
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        sys.exit(0)
+try:
+    with open("'"$AK_REPO"'/harness.toml", "rb") as f:
+        print(tomllib.load(f).get("container", {}).get("image", ""))
+except FileNotFoundError:
+    pass
+' 2>/dev/null || true)"
+IMAGE="${IMAGE_FROM_TOML:-genesis:amd-integration}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
