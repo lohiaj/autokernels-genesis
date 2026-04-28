@@ -4,7 +4,7 @@ prepare.py -- one-time setup for autokernels-genesis.
 
 Verifies:
   1. ROCm and gfx942 are present on the host (rocminfo).
-  2. ~/work/Genesis, ~/work/quadrants, ~/work/newton-assets exist.
+  2. $HOME/work/Genesis, $HOME/work/quadrants, $HOME/work/newton-assets exist.
   3. Each MI300X GPU is idle enough to use (rocm-smi --showuse).
   4. The genesis:amd-integration docker image exists.
   5. Captures a baseline e2e throughput (3 trials) to calibrate the noise floor.
@@ -149,8 +149,8 @@ def check_docker_image(image: str) -> None:
     rc, out = run(["docker", "image", "inspect", image], timeout=15)
     if rc != 0:
         fail(f"image {image} not found locally. Build per prompt_mi300x.md§Build:\n"
-             "  cd ~/work/quadrants && docker buildx build -f Dockerfile.rocm -t quadrants:amd-integration .\n"
-             "  cd ~/work/Genesis   && docker buildx build -f Dockerfile.rocm -t genesis:amd-integration .\n"
+             "  cd $HOME/work/quadrants && docker buildx build -f Dockerfile.rocm -t quadrants:amd-integration .\n"
+             "  cd $HOME/work/Genesis   && docker buildx build -f Dockerfile.rocm -t genesis:amd-integration .\n"
              "OR pass --existing-container <name> to reuse a running container with Genesis+Quadrants installed.")
     ok(f"image {image} present")
 

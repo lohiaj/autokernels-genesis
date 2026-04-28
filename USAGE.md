@@ -21,7 +21,7 @@ my campaign is YOUR_CAMPAIGN. read program-advanced.md and start optimizing.
 ## Prerequisites
 
 - 8× MI300X box with ROCm 6.x and Docker
-- `~/work/Genesis`, `~/work/quadrants`, `~/work/newton-assets` checked out on the host
+- `$HOME/work/Genesis`, `$HOME/work/quadrants`, `$HOME/work/newton-assets` checked out on the host
 - `genesis:amd-integration` Docker image built and locally available
 - [`uv`](https://github.com/astral-sh/uv) on the host
 - `gh` (optional) for any post-run PR work
@@ -31,8 +31,8 @@ my campaign is YOUR_CAMPAIGN. read program-advanced.md and start optimizing.
 Verify hardware, repos, and Docker image; calibrate the noise floor with three baseline benchmarks.
 
 ```bash
-git clone https://github.com/lohiaj/autokernels-genesis.git ~/work/autokernels-genesis
-cd ~/work/autokernels-genesis
+git clone https://github.com/lohiaj/autokernels-genesis.git $HOME/work/autokernels-genesis
+cd $HOME/work/autokernels-genesis
 uv sync
 
 uv run prepare.py
@@ -117,12 +117,12 @@ uv run watchdog.py --clear-halt
 Per the launcher's printed instructions, for each GPU:
 
 ```bash
-cd ~/work/ak-wt/gpu0
+cd $HOME/work/ak-wt/gpu0
 AUTOKERNEL_GPU_ID=0 \
 AUTOKERNEL_CONTAINER=ak-gpu0 \
-GENESIS_SRC=~/work/genesis-wt/gpu0 \
+GENESIS_SRC=$HOME/work/genesis-wt/gpu0 \
 CAMPAIGN=func_broad_phase \
-AUTOKERNEL_SHARED_DIR=~/work/autokernels-shared \
+AUTOKERNEL_SHARED_DIR=$HOME/work/autokernels-shared \
 claude code
 ```
 
@@ -143,17 +143,17 @@ The agent will:
 
 ```bash
 # Per-GPU progress
-tail -f ~/work/ak-wt/gpu0/run.log
-cat ~/work/ak-wt/gpu0/results.tsv
+tail -f $HOME/work/ak-wt/gpu0/run.log
+cat $HOME/work/ak-wt/gpu0/results.tsv
 
 # Cross-agent digest
 uv run global_log.py digest --campaign func_broad_phase --last 100
 
 # Per-GPU local synthesis
-cat ~/work/ak-wt/gpu0/workspace/learning.md
+cat $HOME/work/ak-wt/gpu0/workspace/learning.md
 
 # Watchdog log
-tail -f ~/work/autokernels-genesis/workspace/watchdog.log
+tail -f $HOME/work/autokernels-genesis/workspace/watchdog.log
 ```
 
 ## 7. Morning gate

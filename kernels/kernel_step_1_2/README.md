@@ -8,4 +8,4 @@ Per-campaign directory. The agent reads `target.json` and `playbook.md` at setup
 | `playbook.md` | YES | Tier 1-6 ideas, including the proven `factor_mass` reference pattern |
 | `README.md` | YES | This file |
 
-Edits live in `~/work/Genesis/` (worktree per agent), not here.
+Edits live in `$HOME/work/Genesis/` (worktree per agent), not here.

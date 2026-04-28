@@ -64,7 +64,7 @@ from pathlib import Path
 
 # IMPORTANT: the sandbox must live under a path that's mounted into whatever
 # container you'll run the bench in. On standard AMD perf VMs the perf
-# container (e.g. `gbench`) mounts $AUTOKERNEL_ROOT (default ~/work) as /work.
+# container (e.g. `gbench`) mounts $AUTOKERNEL_ROOT (default $HOME/work) as /work.
 # Putting the sandbox under $AUTOKERNEL_ROOT keeps it visible to the bench.
 # Override with $AUTOKERNEL_SANDBOX if your container mounts elsewhere.
 _AUTOKERNEL_ROOT = Path(os.environ.get("AUTOKERNEL_ROOT", str(Path.home() / "work")))
@@ -75,7 +75,7 @@ DEFAULT_SANDBOX = _AUTOKERNEL_ROOT / ".cache" / "autokernels-genesis-sandbox"
 # Genesis/newton-assets/... resolve correctly inside both the host fs and
 # the bench container. Keys are sandbox-relative target paths;
 # values are source paths under $AUTOKERNEL_ROOT (or absolute) -- the symlink
-# is created RELATIVE so it resolves in both contexts (host: /home/.../work/X,
+# is created RELATIVE so it resolves in both contexts (host: $HOME/work/X,
 # container: /work/X) provided both contexts share the same mount geometry.
 SIBLING_ASSETS: list[tuple[str, str]] = [
     # (target inside Genesis sandbox, sibling repo name under $AUTOKERNEL_ROOT)

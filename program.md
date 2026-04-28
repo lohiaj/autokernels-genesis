@@ -6,7 +6,7 @@ You are an autonomous AMD GPU kernel optimization researcher. The user told you 
 
 You are running on an AMD VM with ROCm 6.x, `rocm-smi`, `rocprofv3`, and (probably) `omniperf` already installed. Use them directly — no Docker required.
 
-**Safety guarantee.** All edits happen in the sandbox at `~/.cache/autokernels-genesis/sandbox/` on a per-session branch named `autokernel/<kernel>-<timestamp>`. The user's existing checkouts of Genesis or Quadrants (if any) under `~/work/` or anywhere else are NEVER touched. `git reset --hard` and `git commit` happen only inside the sandbox.
+**Safety guarantee.** All edits happen in the sandbox at `~/.cache/autokernels-genesis/sandbox/` on a per-session branch named `autokernel/<kernel>-<timestamp>`. The user's existing checkouts of Genesis or Quadrants (if any) under `$HOME/work/` or anywhere else are NEVER touched. `git reset --hard` and `git commit` happen only inside the sandbox.
 
 ---
 
@@ -21,11 +21,11 @@ uv run sandbox.py setup --kernel "$KERNEL_NAME"
 ```
 
 This:
-- Clones **Genesis** from `https://github.com/ROCm/Genesis.git` into `~/work/.cache/autokernels-genesis-sandbox/Genesis` (or refreshes if it exists) and checks out the AMD-perf release branch (default `release/0.4.4.amdperf`; override via `AUTOKERNEL_GENESIS_BRANCH`).
+- Clones **Genesis** from `https://github.com/ROCm/Genesis.git` into `$HOME/work/.cache/autokernels-genesis-sandbox/Genesis` (or refreshes if it exists) and checks out the AMD-perf release branch (default `release/0.4.4.amdperf`; override via `AUTOKERNEL_GENESIS_BRANCH`).
 - Clones **Quadrants** from `https://github.com/ROCm/quadrants.git` and checks out `amd-integration` (override via `AUTOKERNEL_QUADRANTS_BRANCH`).
 - Symlinks `Genesis/newton-assets` to the host's existing copy via a relative symlink that resolves in both host and container.
 - Creates a fresh per-session branch `autokernel/<kernel>-<timestamp>` in each cloned repo. All your edits go on this branch.
-- **(critical)** If `$AUTOKERNEL_CONTAINER` is set and the container has `genesis-world` installed pip-editable, swaps the editable install to point at the sandbox. Without this, the bench would silently run the user's main `/work/Genesis` while you edit the sandbox -- your changes wouldn't take effect. The setup output will print `sandbox: pip-swap -- ...` if a swap happened.
+- **(critical)** If `$AUTOKERNEL_CONTAINER` is set and the container has `genesis-world` installed pip-editable, swaps the editable install to point at the sandbox. Without this, the bench would silently run the user's main `$HOME/work/Genesis` while you edit the sandbox -- your changes wouldn't take effect. The setup output will print `sandbox: pip-swap -- ...` if a swap happened.
 - Records `session_state.json` under the sandbox so `bench.py` can detect mid-session tampering by other agents on the same VM (multi-tenant safety).
 
 After setup, before each bench, the harness automatically runs `sandbox.py verify` to check the session is intact. If another agent's `git checkout` lands in your sandbox, the verify halts with a clear error.
@@ -70,10 +70,10 @@ find "$SANDBOX/Genesis"   -type f \( -name "bench*" -o -name "*benchmark*" \) 2>
 find "$SANDBOX/Quadrants" -type f \( -name "bench*" -o -name "*benchmark*" \) 2>/dev/null | grep -v __pycache__ | head -20
 
 # Standard Genesis location (if present on the VM, OK to reference for invocation pattern)
-ls $HOME/work/work/bench_*.py 2>/dev/null
+ls $HOME/work/bench_*.py 2>/dev/null
 ```
 
-If the project has an existing `bench.py` / `benchmark.sh` / `Makefile bench` target — use it as-is. If you find multiple candidates, pick the most plausible (closest to the kernel source > most recently modified > most-referenced from other tests) and proceed. Note the alternatives in `learning.md` so you can swap if the first choice produces no metric. Only halt at A5 if NO candidate exists *and* `~/work/work/bench_*.py` is empty — that's an infrastructure gap, not an ambiguity.
+If the project has an existing `bench.py` / `benchmark.sh` / `Makefile bench` target — use it as-is. If you find multiple candidates, pick the most plausible (closest to the kernel source > most recently modified > most-referenced from other tests) and proceed. Note the alternatives in `learning.md` so you can swap if the first choice produces no metric. Only halt at A5 if NO candidate exists *and* `$HOME/work/bench_*.py` is empty — that's an infrastructure gap, not an ambiguity.
 
 Note: read-only references to files OUTSIDE the sandbox (e.g. a benchmark harness on the host) are fine — you just don't EDIT outside the sandbox.
 
@@ -162,7 +162,7 @@ uv run ab.py jenkins-pin --check
 #   pinned-manifest-genesis-rock7.11-...yml -> sources.repositories[name=quadrants].revision
 # Then either:
 #   uv run ab.py jenkins-pin --pin <sha>    # cache the value
-#   cd ~/work/quadrants && git fetch && git checkout <sha> && <build>  # align local
+#   cd $HOME/work/quadrants && git fetch && git checkout <sha> && <build>  # align local
 
 # 2. Calibration: reproduce a known-good Jenkins result on the local stack.
 #    Default target is PR #34 B-only (~+3.0% on Genesis G1 8192x500 fp32).
@@ -371,7 +371,7 @@ You read this at the top of every loop iteration. You append after every experim
 
 ## Hard constraints
 
-1. **Edit only inside the sandbox** at `~/.cache/autokernels-genesis/sandbox/`. Never modify the user's own checkouts of Genesis or Quadrants under `~/work/` or anywhere else. `git reset --hard` only inside the sandbox.
+1. **Edit only inside the sandbox** at `~/.cache/autokernels-genesis/sandbox/`. Never modify the user's own checkouts of Genesis or Quadrants under `$HOME/work/` or anywhere else. `git reset --hard` only inside the sandbox.
 2. **Edit only the kernel source file** the human pointed at (or you confirmed). Do not touch the test, the bench harness, the build system, or anything outside the kernel's source file unless you genuinely cannot make progress without it (and even then, ask the human first).
 3. **Correctness first.** A faster wrong kernel is auto-reverted. If you find a way to game correctness, stop and tell the human — that's a bug.
 4. **One focused change per commit.** Combinatorial commits are not attributable.

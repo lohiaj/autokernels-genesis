@@ -108,4 +108,4 @@ Useful filters: `13.1.6` (LDS bank conflicts), `7.1.0` (VGPR), `7.1.1` (AGPR), `
 
 - ROCm CDNA3 ISA reference (gfx942 instruction set): `https://www.amd.com/system/files/TechDocs/amd-instinct-mi300-cdna3-instruction-set-architecture.pdf`
 - ROCm performance tuning: `https://rocm.docs.amd.com/en/latest/how-to/tuning-guides/mi300x.html`
-- Genesis perf tracker (internal): see `project_context.md` for the tracker-prefix-* and LCOMPILER-* tickets.
+- Genesis perf tracker (internal): see `project_context.md` for the per-project tracker references.

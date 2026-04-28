@@ -88,8 +88,8 @@ _DEFAULTS: dict = {
         "exclude_kernel_re": "runtime_initialize_rand_states",
     },
     "host": {
-        "required_dirs": ["~/work/Genesis", "~/work/quadrants", "~/work/newton-assets"],
-        "project_src": "~/work/Genesis",
+        "required_dirs": ["$HOME/work/Genesis", "$HOME/work/quadrants", "$HOME/work/newton-assets"],
+        "project_src": "$HOME/work/Genesis",
         "gpu_arch": "gfx942",
     },
     "correctness": {

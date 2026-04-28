@@ -8,7 +8,7 @@ Per `h100_vs_mi300x_kernel_comparison.txt`: 22.0 ms/call MI300X vs 6.5 ms/call H
 
 ## What the team already shipped
 
-1. **AccVGPR + global_load** ((redacted)/(redacted), TICKET/4420): compiler-layer pass to reduce register spillage and emit `global_load` instead of `flat_load`. **9.83% E2E uplift.** Already in current Quadrants build.
+1. **AccVGPR + global_load** (reference patch): compiler-layer pass to reduce register spillage and emit `global_load` instead of `flat_load`. **9.83% E2E uplift.** Already in current Quadrants build.
 2. **func_update_constraint_batch Jaref hoist** (jlohia, 0c5bd5bd): hoisted multi-read of `Jaref[i_c, i_b]` across writes to `active`. Already in current Genesis branch.
 3. **monolith inner cleanup** (jlohia, bd735f8b on monolith-inner-cleanup branch): consolidated my exp 21+22 — fuse cost loop in update_constraint_batch + hoist cg_prev_Mgrad in terminate_or_update_descent_batch.
 

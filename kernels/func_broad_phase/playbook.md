@@ -19,18 +19,18 @@ Action: grep `block_dim=` in `broadphase.py` and `utils.py`. For each call site:
 - If the kernel is outer-loop-parallel (per-batch, no cross-thread dep), try `block_dim=128` or `256` next. Bigger wave packing → fewer kernel launches → better latency hiding.
 - Symptom of going too large: register spilling (visible in AMDGCN as `scratch_load`/`scratch_store`), kernel slowdown.
 
-Reference patch that worked: `factor_mass` ((redacted), TICKET) — 671 ms → 192 ms (71%) from `BLOCK_DIM=64, WARP_SIZE=64, # wave64: all threads in lockstep`.
+Reference patch that worked: `factor_mass` (reference patch) — 671 ms → 192 ms (71%) from `BLOCK_DIM=64, WARP_SIZE=64, # wave64: all threads in lockstep`.
 
 ## Tier 2 — eliminate scalar ops, use bitfields
 
-Per the TICKET strategy comment from (redacted). Broad-phase pair generation often involves boolean masks (which AABB pairs overlap) — naively done with byte/int per-pair, wastefully wide.
+Per the TICKET strategy comment. Broad-phase pair generation often involves boolean masks (which AABB pairs overlap) — naively done with byte/int per-pair, wastefully wide.
 
 Action: where the kernel writes per-pair flags or per-geom collision masks:
 - Replace `int` flags with bitfield packs (`u32` carrying 32 booleans).
 - Replace per-element `qd.atomic_add(counter, 1)` with batched accumulation (write to a thread-local register, atomic_add the batched count once at the end).
 - Look for `qd.func` calls that return a tuple of small ints; consider packing them into a single `u32`/`u64`.
 
-Reference patch that worked: `add_inequality_constraints` ((redacted) + jlohia, TICKET) — `batched atomic_add(counter 4) per contact` was one of the wins; net +12 LoC; -23.5% kernel; +2.71% E2E.
+Reference patch that worked: `add_inequality_constraints` (reference patch) — `batched atomic_add(counter 4) per contact` was one of the wins; net +12 LoC; -23.5% kernel; +2.71% E2E.
 
 ## Tier 3 — `qd.func` inlining & identity-quat simplification
 

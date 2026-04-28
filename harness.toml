@@ -84,9 +84,9 @@ exclude_kernel_re = "runtime_initialize_rand_states"
 # ---------------------------------------------------------------------------
 [host]
 # What `prepare.py` checks for at setup time.
-required_dirs = ["~/work/Genesis", "~/work/quadrants", "~/work/newton-assets"]
+required_dirs = ["$HOME/work/Genesis", "$HOME/work/quadrants", "$HOME/work/newton-assets"]
 # Default project source path (overridden by $GENESIS_SRC).
-project_src   = "~/work/Genesis"
+project_src   = "$HOME/work/Genesis"
 # rocm-smi / rocminfo substring that identifies the expected GPU arch.
 gpu_arch      = "gfx942"
 

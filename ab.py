@@ -84,7 +84,7 @@ DEFAULT_GPU_WAIT_MAX_S = 300           # spec 2.9: 5 min then abort
 DEFAULT_BASELINE_DRIFT_PCT = 15.0      # spec 2.2: > 15% from previous baseline = abort
 
 # spec 2.11: Quadrants-Jenkins parity
-DEFAULT_JENKINS_PIN_FILE = Path("/home/jlohia/work/v2-dev/research/quadrants-pin.txt")
+DEFAULT_JENKINS_PIN_FILE = Path("$HOME/work/v2-dev/research/quadrants-pin.txt")
 QUADRANTS_BANNER_RE = re.compile(r"\[Quadrants\][^\n]*?commit\s+([0-9a-f]+)", re.I)
 
 # spec 2.12: calibration cache TTL
@@ -440,7 +440,7 @@ def assert_stack_aligned(skip: bool = False) -> dict:
             f"regression on identical Genesis source.\n\n"
             f"Resolve before running A/B:\n"
             f"  1. Rebuild Quadrants against the Jenkins pin (~5-15 min on warm LLVM cache):\n"
-            f"     cd ~/work/quadrants && git fetch && git checkout {pinned}\n"
+            f"     cd $HOME/work/quadrants && git fetch && git checkout {pinned}\n"
             f"     <build + reinstall the wheel>\n"
             f"  2. Or pull a prebuilt wheel matching {pinned} if your team publishes them.\n"
             f"  3. Or pass --skip-stack-check to override (NOT recommended -- this is\n"
@@ -622,7 +622,7 @@ def run_one_untraced(out_path_in_container: str, num_steps: int, warmup: int) ->
 
     # Sandbox URDF if available
     sandbox = os.environ.get("AUTOKERNEL_SANDBOX") or \
-        os.path.expanduser("~/work/.cache/autokernels-genesis-sandbox")
+        os.path.expanduser("$HOME/work/.cache/autokernels-genesis-sandbox")
     sandbox_in_container = sandbox.replace(os.path.expanduser("~/work"), "/work")
     urdf = f"{sandbox_in_container}/Genesis/newton-assets/unitree_g1/urdf/g1_29dof.urdf"
     pythonpath_prefix = f"PYTHONPATH={sandbox_in_container}/Genesis:$PYTHONPATH"
@@ -664,7 +664,7 @@ def run_one_traced(out_dir_in_container: str, num_steps: int) -> dict:
     profiler = cfg.get_profiler_command()
 
     sandbox = os.environ.get("AUTOKERNEL_SANDBOX") or \
-        os.path.expanduser("~/work/.cache/autokernels-genesis-sandbox")
+        os.path.expanduser("$HOME/work/.cache/autokernels-genesis-sandbox")
     sandbox_in_container = sandbox.replace(os.path.expanduser("~/work"), "/work")
     urdf = f"{sandbox_in_container}/Genesis/newton-assets/unitree_g1/urdf/g1_29dof.urdf"
     pythonpath_prefix = f"PYTHONPATH={sandbox_in_container}/Genesis:$PYTHONPATH"
@@ -974,7 +974,7 @@ def make_trial_record(arm: str, trial_idx: int, bench_result: dict,
         "precision": cfg.get_default_precision(),
         "urdf": (
             (os.environ.get("AUTOKERNEL_SANDBOX") or
-             os.path.expanduser("~/work/.cache/autokernels-genesis-sandbox"))
+             os.path.expanduser("$HOME/work/.cache/autokernels-genesis-sandbox"))
             + "/Genesis/newton-assets/unitree_g1/urdf/g1_29dof.urdf"
         ),
         "quadrants_commit": env_meta.get("quadrants_commit", "?"),

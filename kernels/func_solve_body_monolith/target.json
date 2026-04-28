@@ -1,8 +1,8 @@
 {
   "campaign_id": "func_solve_body_monolith",
-  "description": "THE dominant kernel: func_solve_body_monolith_c???_?_kernel_1_range_for. ~54% of GPU time on the the production benchmark. Per the team analysis (h100_vs_mi300x_kernel_comparison.txt) this single kernel accounts for ~56% of the H100<->MI300X gap. Compiler-layer fix already shipped (AccVGPR + global_load via codegen pass, TICKET/4420). DSL-layer optimization is the next lever and lives in func_solve_iter and its callees, which are all inlined into this monolith kernel by Quadrants.",
-  "tracker_ticket": "TICKET (current) + TICKET/4420 (compiler patch shipped)",
-  "owner_human": "(redacted) + (redacted) (compiler), jlohia + agent (DSL)",
+  "description": "THE dominant kernel: func_solve_body_monolith_c???_?_kernel_1_range_for. ~54% of GPU time on the the production benchmark. Per the team analysis (h100_vs_mi300x_kernel_comparison.txt) this single kernel accounts for ~56% of the H100<->MI300X gap. Compiler-layer fix already shipped (AccVGPR + global_load via codegen pass, TICKET). DSL-layer optimization is the next lever and lives in func_solve_iter and its callees, which are all inlined into this monolith kernel by Quadrants.",
+  "tracker_ticket": "TICKET (current) + TICKET (compiler patch shipped)",
+  "owner_human": "(redacted) -- the harness now generic",
   "current_pct_of_h100": 67.05,
   "target_pct_of_h100": 100.0,
   "baseline_kernel_avg_us": 16940.0,

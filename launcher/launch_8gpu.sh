@@ -8,7 +8,7 @@
 #
 # After this exits, each container is running detached. The agent (Claude Code / Codex)
 # is NOT started -- you start one per worktree manually:
-#   for i in 0..7:  cd ~/work/ak-wt/gpu$i  &&  claude code
+#   for i in 0..7:  cd $HOME/work/ak-wt/gpu$i  &&  claude code
 
 set -euo pipefail
 
@@ -102,7 +102,7 @@ for ((i=0; i<NUM_GPUS; i++)); do
       || { echo "  failed to create Genesis worktree at $GEN_WT" >&2; continue; }
     # Genesis expects newton-assets as a sibling/symlink
     ln -sfn "$NEWTON_ASSETS" "$GEN_WT/newton-assets"
-    # Copy benchmark_scaling.py if it lives at ~/work/ rather than inside Genesis
+    # Copy benchmark_scaling.py if it lives at $HOME/work/ rather than inside Genesis
     if [[ ! -f "$GEN_WT/benchmark_scaling.py" && -f "$AUTOKERNEL_ROOT/benchmark_scaling.py" ]]; then
       cp "$AUTOKERNEL_ROOT/benchmark_scaling.py" "$GEN_WT/benchmark_scaling.py"
     fi

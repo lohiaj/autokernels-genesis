@@ -1,8 +1,8 @@
 {
   "campaign_id": "func_broad_phase",
   "description": "Collision broad-phase kernel family in Genesis. Currently 12.85x MI300X/H100 ratio; the worst relative slowdown in the top-8 gap kernels.",
-  "tracker_ticket": "TICKET",
-  "owner_human": "(redacted) (current); jlohia + agent (this campaign)",
+  "tracker_ticket": "TICKET-4497",
+  "owner_human": "(redacted) -- the harness now generic",
   "current_pct_of_h100": 7.78,
   "target_pct_of_h100": 80.0,
   "baseline_kernel_avg_us": 449.61,

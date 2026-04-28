@@ -18,7 +18,7 @@ Sub-kernel current ratios (from `h100_vs_mi300x_kernel_comparison.txt`):
 - `kernel_step_2_c500_kernel_10_forward_velocity_entity`: 2.33×
 - `kernel_step_2_c500_kernel_7`: 5.42×
 
-The **proven reference pattern** is `factor_mass`: BLOCK_DIM=64, WARP_SIZE=64, explicit `# wave64: all threads in lockstep`. Read the diff in `git log` on `~/work/Genesis` (`TICKET`) before making the first edit. **That diff is your model.**
+The **proven reference pattern** is `factor_mass`: BLOCK_DIM=64, WARP_SIZE=64, explicit `# wave64: all threads in lockstep`. Read the diff in `git log` on `$HOME/work/Genesis` (`TICKET`) before making the first edit. **That diff is your model.**
 
 ---
 
@@ -58,10 +58,10 @@ If the function exists and is wired through `qd.simt.warp`, generalize the `ENAB
 
 ## Tier 5 — Cartesian update specifically
 
-`kernel_step_2_kernel_9_update_cartesian_space` is at 4.68× MI300X/H100 with 4.6% of the e2e gap. There's a perf PR in flight ((redacted), TICKET — check `git log` on `ROCm/Genesis` perf branches for `revert-5-revert-4-vrachuma/perf/improve_cartesian_update`).
+`kernel_step_2_kernel_9_update_cartesian_space` is at 4.68× MI300X/H100 with 4.6% of the e2e gap. There's a perf PR in flight (reference patch — check `git log` on `ROCm/Genesis` perf branches for `revert-5-revert-4-vrachuma/perf/improve_cartesian_update`).
 
 Action:
-1. `git log --oneline | grep -i cartesian` on `~/work/Genesis`. If the PR's commits are there, read the diff for inspiration.
+1. `git log --oneline | grep -i cartesian` on `$HOME/work/Genesis`. If the PR's commits are there, read the diff for inspiration.
 2. The kernel transforms per-link state from joint space to Cartesian. Look for chains of `qd.transform` calls where the rotation can be hoisted out of the per-batch loop.
 
 ## Tier 6 — LDS staging for large per-batch state

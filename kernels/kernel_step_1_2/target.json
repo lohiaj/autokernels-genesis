@@ -2,7 +2,7 @@
   "campaign_id": "kernel_step_1_2",
   "description": "kernel_step_1 and kernel_step_2 sub-kernel family in genesis/engine/solvers/rigid/rigid_solver.py. Includes mass_mat_assemble (kernel_5), factor_mass (kernel_10, already DSL-retuned by (redacted) - reference pattern), kernel_11, kernel_25, and update_cartesian_space (step_2_kernel_9). Multiple sub-kernels visible in rocprofv3 as kernel_step_1_c498_*_kernel_N_* and kernel_step_2_c500_*_kernel_N_*.",
   "tracker_ticket": "TICKET (factor_mass, done) + TICKET (cartesian_space) + TICKET (mass_mat_assemble)",
-  "owner_human": "(redacted)/(redacted)/(redacted) (split across sub-kernels); jlohia + agent (this campaign)",
+  "owner_human": "(redacted) -- the harness now generic",
   "current_pct_of_h100": 18.80,
   "target_pct_of_h100": 80.0,
   "baseline_kernel_avg_us": 772.0,
@@ -16,7 +16,7 @@
     },
     {
       "path": "genesis/engine/solvers/rigid/abd/forward_dynamics.py",
-      "rationale": "Contains func_factor_mass at line 574 -- the proven DSL-retune pattern ((redacted), TICKET, 71% kernel reduction via BLOCK_DIM=64 + wave64 comment). Read first as the canonical reference for what a winning DSL change in this family looks like."
+      "rationale": "Contains func_factor_mass at line 574 -- the proven DSL-retune pattern (reference patch, 71% kernel reduction via BLOCK_DIM=64 + wave64 comment). Read first as the canonical reference for what a winning DSL change in this family looks like."
     }
   ],
   "may_also_edit": [
