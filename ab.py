@@ -342,34 +342,63 @@ def get_local_quadrants_commit() -> str | None:
     return m.group(1).strip()
 
 
-def get_jenkins_quadrants_pin(pin_file: Path = DEFAULT_JENKINS_PIN_FILE) -> str | None:
-    """Read the cached Jenkins-pinned Quadrants commit. The pin file format:
+def get_jenkins_quadrants_pin(pin_file: Path = DEFAULT_JENKINS_PIN_FILE
+                              ) -> tuple[str | None, str]:
+    """Read the cached Jenkins-pinned Quadrants commit AND its source provenance.
+    File format:
 
         <commit_sha>
-        # optional metadata lines (build URL, fetch timestamp, etc.)
+        # source: <provenance>            <-- e.g. "manual entry" / "fetched from build #123"
+        # any other comment metadata
 
-    Returns None if the file doesn't exist (caller decides whether to abort)."""
+    Returns (sha or None, source_string). source_string is "manual" if the
+    file's source comment mentions manual entry, "jenkins" if it mentions a
+    Jenkins/build URL, or "unknown" otherwise.
+
+    The source matters: a manually-entered pin that happens to equal the local
+    Quadrants commit is the C2 trap (false `stack_aligned: true`). The caller
+    uses this to refuse to treat such pins as authoritative."""
     if not pin_file.exists():
-        return None
+        return None, "missing"
+    sha = None
+    source = "unknown"
     try:
         for line in pin_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                return line
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not stripped.startswith("#"):
+                if sha is None:
+                    sha = stripped
+                continue
+            low = stripped.lower()
+            if "manual entry" in low:
+                source = "manual"
+            elif any(s in low for s in ("jenkins", "build #", "build/", "pinned-manifest", "aifoundry.amd.com")):
+                source = "jenkins"
     except OSError as e:
         warn(f"could not read {pin_file}: {e}")
-    return None
+        return None, "error"
+    return sha, source
 
 
 def assert_stack_aligned(skip: bool = False) -> dict:
     """Verify local Quadrants commit == Jenkins-pinned commit. Returns a dict
-    suitable for embedding in trial JSON: {local, pinned, aligned, source}.
-    Aborts on mismatch unless skip=True."""
+    suitable for embedding in trial JSON. Aborts on mismatch unless skip=True.
+
+    Trust-hierarchy rule (the AGENTS.md §3.10 footnote): a pin file populated
+    by `ab.py jenkins-pin --pin <sha>` (source: "manual entry") that happens to
+    equal the local Quadrants commit is REFUSED as authoritative. That's the
+    exact false-positive the C2 disaster taught: an operator who guessed the
+    pin from their own local commit produces stack_aligned=true while the
+    actual Jenkins Quadrants is something different. Force a real Jenkins-
+    sourced pin (or accept --skip-stack-check with explicit warning)."""
     local = get_local_quadrants_commit()
-    pinned = get_jenkins_quadrants_pin()
+    pinned, source = get_jenkins_quadrants_pin()
     info_dict = {
         "local_quadrants_commit": local,
         "jenkins_quadrants_commit": pinned,
+        "pin_source": source,
         "stack_aligned": False,
         "pin_file": str(DEFAULT_JENKINS_PIN_FILE),
     }
@@ -388,14 +417,11 @@ def assert_stack_aligned(skip: bool = False) -> dict:
             f"  Jenkins pin file:        {DEFAULT_JENKINS_PIN_FILE} (missing)\n\n"
             f"Cannot verify the local stack matches Jenkins's production stack. "
             f"Either:\n"
-            f"  1. Populate {DEFAULT_JENKINS_PIN_FILE} with the Quadrants commit\n"
-            f"     from Jenkins's latest successful pre-submit pipeline build:\n"
-            f"       echo <jenkins_quadrants_commit_sha> > {DEFAULT_JENKINS_PIN_FILE}\n"
-            f"     (See: build.aifoundry.amd.com/job/genesis/job/pre-submit-amd-integration/ \n"
-            f"      → latest green build → pinned-manifest-genesis-rock7.11-...yml \n"
-            f"      → sources.repositories[name=quadrants].revision)\n"
-            f"  2. Run `uv run ab.py jenkins-pin --pin <sha>` to populate the cache.\n"
-            f"  3. Pass --skip-stack-check to bypass (NOT recommended; risks the C2-style\n"
+            f"  1. Fetch the Jenkins pinned commit from the latest green pre-submit\n"
+            f"     pipeline build at build.aifoundry.amd.com -> pinned-manifest-...yml\n"
+            f"     -> sources.repositories[name=quadrants].revision, then:\n"
+            f"       uv run ab.py jenkins-pin --pin <sha> --provenance 'jenkins build #N'\n"
+            f"  2. Pass --skip-stack-check to bypass (NOT recommended; risks the C2-style\n"
             f"     'looks great locally, regresses on Jenkins' failure mode)."
         )
     if not local.startswith(pinned[:8]) and not pinned.startswith(local[:8]):
@@ -407,7 +433,7 @@ def assert_stack_aligned(skip: bool = False) -> dict:
         die(
             f"QUADRANTS_VERSION_MISMATCH\n"
             f"  local Quadrants commit:    {local}\n"
-            f"  Jenkins pin (production):  {pinned}\n\n"
+            f"  Jenkins pin (production):  {pinned}  (source: {source})\n\n"
             f"This is the C2 failure mode: a local Quadrants cherry-pick that Jenkins\n"
             f"doesn't have can flip a kernel's emit pattern (inlined vs outlined,\n"
             f"register allocation, etc), turning a +2% local win into a -7% Jenkins\n"
@@ -420,8 +446,33 @@ def assert_stack_aligned(skip: bool = False) -> dict:
             f"  3. Or pass --skip-stack-check to override (NOT recommended -- this is\n"
             f"     exactly how the C2 disaster shipped)."
         )
+    # Trust-hierarchy guard: a manually-entered pin matching local Quadrants is
+    # circular evidence (the operator may have just typed in their own commit).
+    if source == "manual":
+        if skip:
+            info_dict["stack_aligned"] = None
+            warn(f"PIN_SOURCE_UNTRUSTWORTHY (skipping per --skip-stack-check): "
+                 f"pin matches local but source is manual entry; could be circular.")
+            return info_dict
+        die(
+            f"PIN_SOURCE_UNTRUSTWORTHY\n"
+            f"  local Quadrants commit:  {local}\n"
+            f"  pin file SHA:            {pinned}  (source: manual entry)\n\n"
+            f"The pin file matches the local Quadrants commit, but the pin's source\n"
+            f"is 'manual entry' -- meaning an operator typed the SHA via\n"
+            f"`ab.py jenkins-pin --pin <sha>`. There's no evidence this SHA actually\n"
+            f"matches what Jenkins's pre-submit pipeline pulls. If the operator\n"
+            f"typed in the local commit (the C2 trap), `stack_aligned: true` would\n"
+            f"silently lie.\n\n"
+            f"Re-pin with provenance pointing at a Jenkins source:\n"
+            f"  uv run ab.py jenkins-pin --pin <sha> --provenance 'jenkins build #N at <URL>'\n"
+            f"...where <sha> is the Quadrants commit recorded in the latest green\n"
+            f"pre-submit-amd-integration build's pinned-manifest YAML.\n\n"
+            f"Or pass --skip-stack-check to override (NOT recommended)."
+        )
     info_dict["stack_aligned"] = True
-    info(f"stack alignment OK: local Quadrants {local} matches Jenkins pin {pinned}")
+    info(f"stack alignment OK: local Quadrants {local} matches Jenkins pin {pinned} "
+         f"(source: {source})")
     return info_dict
 
 
@@ -1302,25 +1353,50 @@ def cmd_jenkins_pin(args: argparse.Namespace) -> int:
     pin_file = DEFAULT_JENKINS_PIN_FILE
     if args.pin:
         pin_file.parent.mkdir(parents=True, exist_ok=True)
+        # Provenance line decides whether assert_stack_aligned() trusts this pin.
+        # Default is "manual entry" (which the trust-hierarchy check rejects if
+        # the SHA happens to match local Quadrants -- that's the C2 trap).
+        # Pass --provenance "jenkins build #123 at <URL>" to mark as authoritative.
+        provenance = (args.provenance
+                      or "manual entry via `ab.py jenkins-pin --pin <sha>` "
+                         "(NOT trusted as Jenkins-authoritative; pass --provenance "
+                         "to record the actual source)")
         pin_file.write_text(
             f"{args.pin}\n"
             f"# recorded at {datetime.now(timezone.utc).isoformat()}\n"
-            f"# source: manual entry via `ab.py jenkins-pin --pin <sha>`\n"
+            f"# source: {provenance}\n"
         )
-        print(f"jenkins-pin: wrote {args.pin} to {pin_file}")
+        is_jenkins_sourced = any(
+            s in provenance.lower()
+            for s in ("jenkins", "build #", "pinned-manifest", "aifoundry.amd.com"))
+        if is_jenkins_sourced:
+            print(f"jenkins-pin: wrote {args.pin} to {pin_file} (source: jenkins-authoritative)")
+        else:
+            print(f"jenkins-pin: wrote {args.pin} to {pin_file}")
+            print(f"  WARNING: source defaulted to 'manual entry'. The pin will NOT be")
+            print(f"  trusted by `ab.py ab` if it equals the local Quadrants commit")
+            print(f"  (that's the C2 trap). Re-run with --provenance 'jenkins build #N'")
+            print(f"  once you've confirmed the SHA actually matches Jenkins's pinned manifest.")
         return 0
     if args.show or args.check:
         local = get_local_quadrants_commit()
-        pinned = get_jenkins_quadrants_pin()
+        pinned, source = get_jenkins_quadrants_pin()
         print(f"local Quadrants:    {local}")
-        print(f"Jenkins pin:        {pinned}")
+        print(f"Jenkins pin:        {pinned}  (source: {source})")
         print(f"pin file:           {pin_file} ({'exists' if pin_file.exists() else 'MISSING'})")
         if args.check:
-            if local and pinned and (local.startswith(pinned[:8]) or pinned.startswith(local[:8])):
-                print("aligned: YES")
-                return 0
-            print("aligned: NO")
-            return 2
+            if not (local and pinned):
+                print("aligned: NO  (missing local or pin)")
+                return 2
+            sha_match = local.startswith(pinned[:8]) or pinned.startswith(local[:8])
+            if not sha_match:
+                print("aligned: NO  (SHA mismatch)")
+                return 2
+            if source == "manual":
+                print("aligned: NO  (pin source is manual entry; refused as untrustworthy)")
+                return 2
+            print("aligned: YES")
+            return 0
         return 0
     print("jenkins-pin: pass --pin <sha>, --show, or --check (see --help)",
           file=sys.stderr)
@@ -1533,10 +1609,14 @@ def main() -> int:
     jp = sub.add_parser("jenkins-pin",
                         help="manage the Jenkins-pinned Quadrants commit cache (spec 2.11)")
     jp.add_argument("--pin", help="set the pinned commit SHA (writes to cache file)")
+    jp.add_argument("--provenance",
+                    help="source of the pin (e.g. 'jenkins build #123 at <URL>'). "
+                         "Without this, the pin defaults to 'manual entry' and will "
+                         "NOT be trusted by `ab.py ab` if it equals local Quadrants.")
     jp.add_argument("--show", action="store_true",
-                    help="show local + Jenkins pinned commits")
+                    help="show local + Jenkins pinned commits + source")
     jp.add_argument("--check", action="store_true",
-                    help="exit 0 if aligned, 2 otherwise")
+                    help="exit 0 if aligned with trustworthy source, 2 otherwise")
 
     # calibrate
     c = sub.add_parser("calibrate",
