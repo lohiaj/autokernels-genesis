@@ -23,7 +23,7 @@ Bug labels we care about most:
 Small PRs land fast. Things we'd love:
 
 - **More per-kernel `classes.json` entries** for the advanced mode. If you maintain a kernel family, write a `kernels/<your_campaign>/classes.json` with the regex vocabulary that classifies your hypotheses. See `_classify.py::DEFAULT_PATTERNS` for the format.
-- **Sandbox URL defaults** for AMD-internal repos. If your team has a stable URL for Quadrants (or another tool) and is willing to make it the public default, send a PR that updates `sandbox.py::REPOS`. Keep the env-var override path so other teams can point elsewhere.
+- **New release-branch defaults** in `sandbox.py::REPOS`. Today's defaults are `ROCm/Genesis@release/0.4.4.amdperf` and `ROCm/quadrants@amd-integration`. When a newer AMD-perf release branch supersedes them, send a PR bumping the defaults — keep the env-var override paths so older sessions can pin to a specific branch.
 - **Better recon heuristics in `program.md`**. If you have a kernel where the agent stalled at A1/A2/A3 because the find/grep pattern missed it, document the pattern that *would* have worked and add it to the `program.md` reconnaissance phase.
 - **Profiler integrations beyond `rocprofv3` / `omniperf`**. If you'd like the harness to read `rocprof-compute` or vendor-specific profiler output, see how `bench.py::parse_kernel_stats` does it for `rocprofv3` and follow the same pattern.
 

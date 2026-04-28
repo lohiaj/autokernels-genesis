@@ -48,19 +48,22 @@ from pathlib import Path
 DEFAULT_SANDBOX = Path.home() / ".cache" / "autokernels-genesis" / "sandbox"
 
 REPOS: dict[str, dict[str, str]] = {
+    # Both repos are public ROCm forks tuned for AMD perf work. Defaults track
+    # the active AMD-perf release branch as of 2026-04 -- override via env if
+    # a newer one supersedes them.
     "Genesis": {
         "url_env":    "AUTOKERNEL_GENESIS_URL",
-        "url_default": "https://github.com/Genesis-Embodied-AI/Genesis",
+        "url_default": "https://github.com/ROCm/Genesis.git",
         "branch_env":    "AUTOKERNEL_GENESIS_BRANCH",
-        "branch_default": "main",
+        "branch_default": "release/0.4.4.amdperf",
         "required": True,
     },
     "Quadrants": {
         "url_env":    "AUTOKERNEL_QUADRANTS_URL",
-        "url_default": "",  # no public default; user/team must provide
+        "url_default": "https://github.com/ROCm/quadrants.git",
         "branch_env":    "AUTOKERNEL_QUADRANTS_BRANCH",
-        "branch_default": "main",
-        "required": False,
+        "branch_default": "amd-integration",
+        "required": True,
     },
 }
 

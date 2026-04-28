@@ -21,12 +21,11 @@ uv run sandbox.py setup --kernel "$KERNEL_NAME"
 ```
 
 This:
-- Clones Genesis into `~/.cache/autokernels-genesis/sandbox/Genesis` (or refreshes if it exists) and checks out the latest release branch.
-- Same for Quadrants if `AUTOKERNEL_QUADRANTS_URL` is set in the environment. If not, Quadrants is skipped — if your kernel lives in Quadrants, ask the human for the URL and rerun:
-  ```bash
-  AUTOKERNEL_QUADRANTS_URL=<your_amd_team_quadrants_url> uv run sandbox.py setup --kernel "$KERNEL_NAME"
-  ```
+- Clones **Genesis** from `https://github.com/ROCm/Genesis.git` into `~/.cache/autokernels-genesis/sandbox/Genesis` (or refreshes if it exists) and checks out the AMD-perf release branch (default `release/0.4.4.amdperf`; override via `AUTOKERNEL_GENESIS_BRANCH`).
+- Clones **Quadrants** from `https://github.com/ROCm/quadrants.git` into `~/.cache/autokernels-genesis/sandbox/Quadrants` and checks out `amd-integration` (override via `AUTOKERNEL_QUADRANTS_BRANCH`).
 - Creates a fresh per-session branch `autokernel/<kernel>-<timestamp>` in each cloned repo. All your edits go on this branch. Reverts (`git reset --hard HEAD~1`) only walk back commits you made on this session branch.
+
+Both URLs and branches are configurable via env vars (`AUTOKERNEL_GENESIS_URL`, `AUTOKERNEL_GENESIS_BRANCH`, `AUTOKERNEL_QUADRANTS_URL`, `AUTOKERNEL_QUADRANTS_BRANCH`) if you need to point at a fork or a newer release branch.
 
 Capture the sandbox paths the script prints — you'll grep them in A1, edit them in B1.
 
@@ -43,7 +42,7 @@ grep -rn "$KERNEL_NAME" \
 
 Look for the *definition* (`def`, `void`, `__global__`, `@qd.kernel`, etc.), not just call sites. If the kernel name is ambiguous (matches multiple unrelated definitions), show the candidates to the human and ask which one. Do NOT silently pick.
 
-If the kernel is Quadrants-side and Quadrants wasn't cloned (no URL set), stop here and ask the human for the URL.
+Both repos are cloned by default, so the kernel will be in one of them unless the user pointed `AUTOKERNEL_*_URL` at an unusual fork. If the grep returns nothing in either, ask the human to confirm the kernel name spelling.
 
 ### A2. Find the bench command
 
