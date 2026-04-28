@@ -517,6 +517,57 @@ def _select_8192_entry(parsed: object) -> dict | None:
     return parsed[-1] if parsed else None
 
 
+# ---------------------------------------------------------------------------
+# AMDGCN dump (Move 37 escape hatch)
+# ---------------------------------------------------------------------------
+# Extracts the LLVM IR that Quadrants caches in /root/.cache/quadrants/qdcache/.
+# The IR is amdgcn-targeted -- it shows exactly what the compiler chose to
+# emit for this kernel, including alloca/spill patterns, load/store address
+# spaces, intrinsic usage, inlining decisions. It's the closest off-distribution
+# input we can give the agent without recompiling Quadrants itself.
+#
+# We do NOT pre-analyze the dump (no regex pattern detector). The agent reads
+# the IR directly and decides what's interesting. See references/amdgcn_patterns.md
+# for examples of what to look for, but the agent is free to spot novel things.
+#
+# Returns a list of paths to .ll files inside the container.
+
+def _dump_amdgcn_in_container(out_dir: str, marker_file: str) -> list[str]:
+    """Find Quadrants cache files modified since marker_file was touched,
+    extract LLVM IR via `strings`, save to out_dir/amdgcn/. Returns list of
+    container-side paths to the produced .ll files (or [] if none / unsupported)."""
+    cmd = (
+        f"mkdir -p {out_dir}/amdgcn && "
+        # Quadrants cache lives under ~/.cache/quadrants on the user inside the
+        # container. The kernel-compilation-manager subdir holds .tic files, each
+        # containing the LLVM IR for one compiled kernel.
+        f"CACHE=/root/.cache/quadrants/qdcache/kernel_compilation_manager && "
+        f"if [ ! -d \"$CACHE\" ]; then echo 'NO_CACHE'; exit 0; fi && "
+        f"COUNT=0 && "
+        # -newer reads the marker's mtime; -type f filters; -name only .tic
+        f"for tic in $(find \"$CACHE\" -name '*.tic' -newer {marker_file} -type f 2>/dev/null); do "
+        f"    name=$(basename \"$tic\" .tic | head -c 16); "
+        f"    out={out_dir}/amdgcn/${{name}}.ll; "
+        # `strings` extracts the readable text from the .tic serialization.
+        # `sed` keeps everything from the LLVM `target triple` line onward
+        # (drops the cache header noise).
+        f"    strings \"$tic\" 2>/dev/null | sed -n '/^target triple/,$p' > \"$out\"; "
+        f"    if [ -s \"$out\" ]; then echo \"$out\"; COUNT=$((COUNT+1)); else rm -f \"$out\"; fi; "
+        f"done; "
+        f"echo \"AMDGCN_DUMP_COUNT=$COUNT\" >&2"
+    )
+    rc, out = _docker_exec(cmd, timeout=60)
+    if rc != 0:
+        warn(f"amdgcn dump failed (rc={rc}): {out[-300:]}")
+        return []
+    if "NO_CACHE" in out:
+        warn("amdgcn dump: Quadrants cache not found (non-Quadrants project? skipping)")
+        return []
+    paths = [line.strip() for line in out.splitlines()
+             if line.strip().endswith(".ll")]
+    return paths
+
+
 def _peak_vram_mb_in_container() -> float | None:
     """Best-effort: parse `rocm-smi --showmeminfo vram` for the pinned GPU."""
     rc, out = _docker_exec("rocm-smi --showmeminfo vram 2>&1", timeout=10)
@@ -599,6 +650,10 @@ def main() -> int:
     ap.add_argument("--no-rubric-check", action="store_true",
                     help="bypass the B1.5 three-question rubric enforcement on the HEAD commit "
                          "(use only for explicit out-of-band runs)")
+    ap.add_argument("--dump-amdgcn", action="store_true",
+                    help="extract LLVM IR for kernels compiled during this bench (Move 37 escape "
+                         "hatch -- gives the agent off-distribution compiler output to reason about). "
+                         "See references/amdgcn_patterns.md for what to look for.")
     args = ap.parse_args()
 
     # Sanity
@@ -643,6 +698,13 @@ def main() -> int:
     # runs_dir is configured in harness.toml::container.runs_dir.
     run_id = time.strftime("%Y%m%d-%H%M%S")
     out_dir_in_container = f"{cfg.get_runs_dir()}/{args.campaign}-{run_id}"
+
+    # If the user wants the AMDGCN dump, drop a marker file BEFORE the bench so
+    # we can find only the kernels compiled during THIS run (not stale cache).
+    amdgcn_marker = None
+    if args.dump_amdgcn:
+        amdgcn_marker = f"{out_dir_in_container}/.amdgcn_marker"
+        _docker_exec(f"mkdir -p {out_dir_in_container} && touch {amdgcn_marker}", timeout=15)
 
     # Step 3: untraced bench (headline e2e) -- N trials for variance estimate.
     # Pin GPU clocks for the duration of the WHOLE bench (untraced + traced) to
@@ -720,6 +782,20 @@ def main() -> int:
             )
 
     peak_vram = _peak_vram_mb_in_container() or 0.0
+
+    # AMDGCN dump (Move 37 escape hatch) -- emit AFTER bench so the cache is
+    # populated. Print paths to stderr so the agent can find them.
+    if amdgcn_marker:
+        print("bench: dumping AMDGCN/LLVM IR for kernels compiled this run...")
+        ll_paths = _dump_amdgcn_in_container(out_dir_in_container, amdgcn_marker)
+        if ll_paths:
+            print(f"amdgcn dump: {len(ll_paths)} kernel(s) extracted to {out_dir_in_container}/amdgcn/",
+                  file=sys.stderr)
+            for p in ll_paths:
+                print(f"amdgcn dump: {p}", file=sys.stderr)
+        else:
+            print("amdgcn dump: no kernels extracted (cache empty or non-Quadrants project)",
+                  file=sys.stderr)
 
     print_contract(
         correctness=correctness,

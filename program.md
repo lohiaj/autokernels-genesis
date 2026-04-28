@@ -208,13 +208,38 @@ One focused change per experiment. Do not combine "block_dim=64 + atomic batchin
 
 ### B4. When stuck (≥5 reverts in a row)
 
-Do **not** re-try the next item from your mental playbook — that is exactly what produced the original plateau. Pick one of these and execute as your next hypothesis:
+Do **not** re-try the next item from your mental playbook — that is exactly what produced the original plateau. The five escalations below are in priority order; do them in order, not at random.
 
-- **Profile-cited hypothesis.** Run omniperf, find the dominant bottleneck, target it specifically.
-- **Switch hypothesis class.** If the last 5 reverts were all `block_dim` tweaks, switch to fusion / hoisting / layout / async loads / etc.
-- **Deletion-only commit.** Find provably-unused code (dead branches, redundant guards) and delete it. The simplicity tiebreaker keeps it if perf is flat. This expands the surface for future edits.
-- **Apply a pattern from a sibling kernel.** If another kernel in the same repo has a recent perf win, check the commit and try the same technique on yours.
-- **Try a structurally different decomposition.** Not "one more block_dim sweep" but "what if I batched these atomic_adds" or "what if I reordered the inner two loops".
+**1. (FIRST, try this) Read what the compiler actually emitted for your kernel.**
+
+This is the highest-leverage escalation because it's the only one that gives you off-distribution input — your specific kernel's compiled IR. Most checklist hypotheses come from your training prior on human-written kernel code; this gives you the data the LLM hasn't seen.
+
+```bash
+SANDBOX="${AUTOKERNEL_SANDBOX:-$HOME/work/.cache/autokernels-genesis-sandbox}"
+SANDBOX_C=$(echo "$SANDBOX" | sed "s|$HOME/work|/work|")
+
+# Re-bench with --dump-amdgcn (this rebuilds the cache + dumps every kernel)
+docker exec gbench bash -c "rm -rf /root/.cache/quadrants /root/.cache/mesa_shader_cache"
+AUTOKERNEL_CONTAINER=gbench AUTOKERNEL_GPU_ID=0 GENESIS_SRC=$SANDBOX/Genesis \
+  uv run bench.py --campaign $CAMPAIGN --dump-amdgcn --skip-traced --trials 1 --no-rubric-check \
+  > /tmp/dump_run.log 2>&1
+
+# Find the .ll file for YOUR kernel (greps the dump dir for the kernel name)
+DUMP_DIR=$(grep "amdgcn dump:" /tmp/dump_run.log | grep "extracted to" | sed 's/.*to //; s| .*||')
+docker exec gbench bash -c "grep -l '$KERNEL_NAME' $DUMP_DIR/*.ll" | head -3
+```
+
+Pick one of those `.ll` files and read it (it'll be 200-2000 lines). Look for the patterns described in [`references/amdgcn_patterns.md`](references/amdgcn_patterns.md) — register spill (`alloca` in `addrspace(5)`), missed vectorization (consecutive scalar loads at sequential offsets), address-space mismatches (`ptr` instead of `ptr addrspace(1)`), missing intrinsics (`@llvm.amdgcn.*`), surprising inlined fragments. Crucially, also look for things that aren't on that list but strike you as odd in YOUR kernel.
+
+Form a hypothesis citing what you saw in line 1 of the rubric (e.g., "Current dominant bottleneck: 47 alloca's in addrspace(5) at lines 312-441 → register spill in the contact-pair inner loop"). Re-dump after the experiment and confirm the pattern moved.
+
+**2. Switch hypothesis class.** If the last 5 reverts were all `block_dim` tweaks, switch to fusion / hoisting / layout / async loads / etc. Pick a class with the highest `success_rate` in `learning.md`, or one you have NEVER tried (missing classes are signal).
+
+**3. Apply a pattern from a sibling kernel.** If another kernel in the same repo has a recent perf win (look at recent kept commits with `git log --grep='\\[KEPT\\]' -10`), check the commit and try the same technique on yours.
+
+**4. Try a deletion-only commit.** Find provably-unused code (dead branches, redundant guards) and delete it. The simplicity tiebreaker keeps it if perf is flat. This expands the surface for future edits.
+
+**5. Try a structurally different decomposition.** Not "one more block_dim sweep" but "what if I batched these atomic_adds" or "what if I reordered the inner two loops". For Genesis specifically, run `omniperf` here — its `VGPR / LDS bank conflicts / Occupancy` metrics suggest concrete restructurings.
 
 Append a line to `learning.md` summarizing what you tried and why. This is how the loop accumulates intelligence.
 
