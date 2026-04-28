@@ -79,16 +79,38 @@ If there is no obvious test, ask the human. Never optimize without a correctness
 
 ### A4. Run the baseline
 
-Once you have a bench command + correctness check, run them once on the unedited source:
+Once you have a bench command + correctness check, run them once on the unedited sandbox source.
+
+**For Genesis / Quadrants on AMD perf VMs**, the bench almost always runs inside a Docker container (e.g. `gbench`) that has Genesis + Quadrants + PyTorch-ROCm pre-installed. The host Python typically does NOT have these packages — so a bare `python3 ...` will `ModuleNotFoundError`. The pattern is:
 
 ```bash
-# Correctness first (must PASS, else stop)
-<correctness command> 2>&1 | tee correctness.log
-echo "correctness exit: $?"
+SANDBOX="${AUTOKERNEL_SANDBOX:-$HOME/work/.cache/autokernels-genesis-sandbox}"
+CONTAINER=gbench   # or whichever perf container is running on the VM
 
-# Bench second
-<bench command> 2>&1 | tee run.log
+# Container path = host path with $AUTOKERNEL_ROOT replaced by the container's mount.
+# On standard AMD perf VMs, $AUTOKERNEL_ROOT (~/work) maps to /work in the container.
+SANDBOX_IN_CONTAINER=$(echo "$SANDBOX" | sed "s|$HOME/work|/work|")
+
+docker exec "$CONTAINER" bash -c "
+  rm -rf /root/.cache/quadrants /root/.cache/mesa_shader_cache 2>/dev/null
+  PYTHONPATH=$SANDBOX_IN_CONTAINER/Genesis:\$PYTHONPATH \
+  GS_FAST_MATH=0 PYOPENGL_PLATFORM=egl EGL_PLATFORM=surfaceless PYGLET_HEADLESS=true \
+  python3 /work/bench_mi300.py \
+    --urdf $SANDBOX_IN_CONTAINER/Genesis/newton-assets/unitree_g1/urdf/g1_29dof.urdf \
+    --n-envs 8192 --num-steps 100 --precision 32 \
+    --out /tmp/baseline.json --tag baseline
+" 2>&1 | tee run.log
+docker exec "$CONTAINER" cat /tmp/baseline.json | tee baseline.json
 ```
+
+Critical bits:
+- `PYTHONPATH` overrides Python's import order so `import genesis` resolves to the SANDBOX clone, not the container's installed Genesis. This is what makes the agent's edits actually take effect.
+- `--urdf` points at the sandbox's symlinked `newton-assets` (auto-created by `sandbox.py setup`).
+- The kernel cache wipe is non-negotiable — without it, the JIT serves the previous compiled kernel and your edit silently no-ops.
+
+If the host Python actually CAN import genesis (rare; some non-perf VMs are set up this way), skip the `docker exec` wrapper and run `python3 ...` directly.
+
+**For non-Genesis kernels** (CK, AITER, hipBLASLt, custom), the pattern is whatever bench command you discovered in A2 — typically a plain `python3 bench.py` or `make bench-X` with no container needed.
 
 Extract the metric the bench reports (kernel time in µs, throughput, GFLOPS, whatever). This is your baseline.
 

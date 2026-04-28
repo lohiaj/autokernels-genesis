@@ -20,14 +20,15 @@ That's it. The agent reads `program.md`, locates your kernel in the source tree,
 
 ## Prerequisites
 
-The agent assumes you're on an AMD VM with the standard toolchain pre-installed:
+The agent assumes you're on an AMD perf VM with the standard toolchain pre-installed:
 
 - ROCm 6.x (`rocm-smi`, `rocprofv3`, `omniperf`)
 - Python 3.10+
 - Git
-- Your kernel's source repo cloned somewhere under `$HOME`
+- For **Genesis / Quadrants** kernels: a running perf container (e.g. `gbench`) with Genesis + Quadrants + PyTorch-ROCm installed and `$AUTOKERNEL_ROOT` (default `~/work`) mounted into it. The agent runs benches via `docker exec` against this container — the host Python typically doesn't have these packages.
+- For **non-Genesis** kernels (Composable Kernel, AITER, hipBLASLt, custom): no Docker required; the agent just runs the bench command directly.
 
-No Docker, no setup script, no harness configuration. The agent does the discovery itself.
+No setup script, no harness configuration. The agent does discovery + clones the repos itself into a sandbox.
 
 ## What the agent does
 

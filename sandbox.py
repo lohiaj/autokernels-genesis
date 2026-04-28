@@ -45,7 +45,25 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_SANDBOX = Path.home() / ".cache" / "autokernels-genesis" / "sandbox"
+# IMPORTANT: the sandbox must live under a path that's mounted into whatever
+# container you'll run the bench in. On standard AMD perf VMs the perf
+# container (e.g. `gbench`) mounts $AUTOKERNEL_ROOT (default ~/work) as /work.
+# Putting the sandbox under $AUTOKERNEL_ROOT keeps it visible to the bench.
+# Override with $AUTOKERNEL_SANDBOX if your container mounts elsewhere.
+_AUTOKERNEL_ROOT = Path(os.environ.get("AUTOKERNEL_ROOT", str(Path.home() / "work")))
+DEFAULT_SANDBOX = _AUTOKERNEL_ROOT / ".cache" / "autokernels-genesis-sandbox"
+
+# Sibling assets (typically separate repos like newton-assets) that we want
+# symlinked INTO the sandbox so Genesis-style imports of e.g.
+# Genesis/newton-assets/... resolve correctly inside both the host fs and
+# the bench container. Keys are sandbox-relative target paths;
+# values are source paths under $AUTOKERNEL_ROOT (or absolute) -- the symlink
+# is created RELATIVE so it resolves in both contexts (host: /home/.../work/X,
+# container: /work/X) provided both contexts share the same mount geometry.
+SIBLING_ASSETS: list[tuple[str, str]] = [
+    # (target inside Genesis sandbox, sibling repo name under $AUTOKERNEL_ROOT)
+    ("Genesis/newton-assets", "newton-assets"),
+]
 
 REPOS: dict[str, dict[str, str]] = {
     # Both repos are public ROCm forks tuned for AMD perf work. Defaults track
@@ -139,6 +157,38 @@ def _new_session_branch(name: str, target: Path, kernel: str) -> str:
     return branch
 
 
+def _link_sibling_assets() -> None:
+    """Create RELATIVE symlinks for sibling assets so they resolve in BOTH
+    host and container contexts (provided both share the mount geometry).
+
+    For example: ../../newton-assets from Genesis/newton-assets points to
+    $SANDBOX/../newton-assets. On the host that's $AUTOKERNEL_ROOT/newton-assets;
+    inside the container that's /work/newton-assets if /work is the mount
+    of $AUTOKERNEL_ROOT. Both work."""
+    sandbox = _sandbox_dir()
+    for target_relpath, sibling in SIBLING_ASSETS:
+        target = sandbox / target_relpath
+        # Source: walk up from target to a sibling under $AUTOKERNEL_ROOT
+        # If $AUTOKERNEL_ROOT/sibling exists, point at it via a relative path
+        sibling_host = _AUTOKERNEL_ROOT / sibling
+        if not sibling_host.exists():
+            print(f"sandbox: SKIP symlink {target_relpath} (no {sibling_host} on host)")
+            continue
+        # Make sure the parent of `target` exists (it's inside a cloned repo)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Compute the relative path from target's parent to sibling_host
+        try:
+            rel = os.path.relpath(sibling_host, target.parent)
+        except ValueError:
+            # Different drives on Windows -- skip
+            print(f"sandbox: SKIP symlink {target_relpath} (no relative path possible)")
+            continue
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        target.symlink_to(rel)
+        print(f"sandbox: linked {target_relpath} -> {rel}  (resolves to {sibling_host})")
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -158,6 +208,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
         _refresh(name, target)
         _new_session_branch(name, target, args.kernel)
         paths[name] = target
+
+    # Sibling assets (newton-assets, etc.) need to be reachable from inside the
+    # cloned repos so Genesis-style imports work. Use relative symlinks so they
+    # resolve in both host and container.
+    if paths:
+        _link_sibling_assets()
 
     print()
     print("=" * 60)
