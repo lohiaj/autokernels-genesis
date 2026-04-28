@@ -297,7 +297,11 @@ def write_plan(noise_pct: float, baseline_throughput: float | None) -> None:
         "baseline_e2e_throughput": baseline_throughput,
         "h100_throughput_ref": 794280.0,
         "campaigns": campaigns,
+        # Soft advisory thresholds. As of the loop redesign, these no longer
+        # cause `orchestrate.py next` to return DONE -- they only emit warnings
+        # on stderr. The only legitimate stop is human SIGINT or watchdog HALT.
         "move_on_criteria": {
+            "warn_consecutive_reverts": 5,
             "consecutive_reverts": 8,
             "max_experiments_per_campaign": 80,
             "kernel_pct_target": 80.0,

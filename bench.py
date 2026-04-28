@@ -29,7 +29,7 @@ Exit codes:
   1  -- harness error (container missing, target.json malformed, etc.)
   2  -- bench timed out
 
-H100 reference (constant): 794280 env*steps/s @ 8192/500/FP32 -- see project_context.md
+H100 reference (constant): 794280 env*steps/s @ 8192/500/FP32 -- see references/project_context.md
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ import json
 import os
 import re
 import shlex
+import statistics
 import subprocess
 import sys
 import time
@@ -49,7 +50,7 @@ from pathlib import Path
 # Constants
 # ---------------------------------------------------------------------------
 
-H100_THROUGHPUT_REF = 794280.0   # env*steps/s, from project_context.md
+H100_THROUGHPUT_REF = 794280.0   # env*steps/s, from references/project_context.md
 DEFAULT_E2E_NSTEPS = 500         # untraced (headline)
 DEFAULT_PROF_NSTEPS = 100        # traced (per-kernel attribution; rocprofv3 has ~30% overhead)
 DEFAULT_NENVS = 8192
@@ -58,6 +59,7 @@ DEFAULT_PRECISION = "32"
 UNTRACED_TIMEOUT_S = 600         # 10 min hard ceiling for untraced bench
 TRACED_TIMEOUT_S = 900           # 15 min for traced (slower, more steps in profile mode)
 CORRECTNESS_TIMEOUT_S = 600      # 10 min for scoped pytest
+DEFAULT_TRIALS = 3               # untraced trials per bench (mean + stdev)
 
 EXCLUDE_KERNEL_RE = re.compile(r"runtime_initialize_rand_states")
 
@@ -66,6 +68,80 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 KERNELS_DIR = SCRIPT_DIR / "kernels"
 WORKSPACE_DIR = SCRIPT_DIR / "workspace"
 RUNS_DIR = SCRIPT_DIR / "runs"
+
+# ---------------------------------------------------------------------------
+# Forcing-function rubric enforcement
+# ---------------------------------------------------------------------------
+# program.md::B1.5 requires every hypothesis commit to include three lines:
+#   1. Current dominant bottleneck:  ...
+#   2. Smallest change to move it:   ...
+#   3. Prior(working): 0.NN          -- ...
+# This catches the "agent forgot the rubric and reverted to checklist mode"
+# failure that produced the original 4-5-iteration plateau. Bypasses:
+#   - commit message starting with "baseline" or "exp 0:" (initial calibration)
+#   - --no-rubric-check on the bench.py command line
+# Intentionally permissive on the third line (regex matches a probability or
+# the literal "skip" tag) so explicit deviations can be logged without nagging.
+
+RUBRIC_RE_BOTTLENECK = re.compile(r"^\s*1\.\s*(?:current\s+)?(?:dominant\s+)?bottleneck", re.I | re.M)
+RUBRIC_RE_CHANGE     = re.compile(r"^\s*2\.\s*(?:smallest\s+)?change", re.I | re.M)
+RUBRIC_RE_PRIOR      = re.compile(r"^\s*3\.\s*prior", re.I | re.M)
+RUBRIC_BASELINE_RE   = re.compile(r"^\s*(baseline|exp\s*0\b)", re.I | re.M)
+
+
+def _head_commit_msg() -> str:
+    """Return the latest commit message body in $GENESIS_SRC, or '' on error."""
+    src = _genesis_src()
+    try:
+        r = subprocess.run(
+            ["git", "-C", src, "log", "-1", "--pretty=%B"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            return r.stdout or ""
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return ""
+
+
+def check_rubric_or_die(skip: bool) -> None:
+    """Enforce the B1.5 forcing-function rubric on the HEAD commit message.
+
+    Skipped if `skip` is True or the commit subject is a baseline.
+    Exits 1 with a structured error if the rubric is missing -- this is what
+    converts the rubric from an aspirational instruction into structural
+    enforcement, since the bench refuses to spend cycles on un-thought experiments.
+    """
+    if skip:
+        return
+    msg = _head_commit_msg()
+    if not msg.strip():
+        warn("could not read HEAD commit message in $GENESIS_SRC; rubric check skipped")
+        return
+    if RUBRIC_BASELINE_RE.search(msg):
+        return  # baseline run -- rubric not required
+    have = [
+        ("1. bottleneck", bool(RUBRIC_RE_BOTTLENECK.search(msg))),
+        ("2. change",     bool(RUBRIC_RE_CHANGE.search(msg))),
+        ("3. prior",      bool(RUBRIC_RE_PRIOR.search(msg))),
+    ]
+    missing = [k for k, ok in have if not ok]
+    if missing:
+        print()
+        print("=" * 72, file=sys.stderr)
+        print("bench: ABORT -- HEAD commit message is missing the B1.5 rubric.", file=sys.stderr)
+        print(f"missing lines: {missing}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Required (in the commit body, anywhere -- one per line):", file=sys.stderr)
+        print("  1. Current dominant bottleneck:  <cited from rocprofv3 / omniperf>", file=sys.stderr)
+        print("  2. Smallest change to move it:   <one file, one symbol, one construct>", file=sys.stderr)
+        print("  3. Prior(working): 0.NN          -- <one sentence>", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Fix: amend the commit, OR pass --no-rubric-check (avoid; it bypasses", file=sys.stderr)
+        print("     the forcing function that exists to prevent checklist-mode reverts).", file=sys.stderr)
+        print("=" * 72, file=sys.stderr)
+        sys.exit(1)
+
 
 # ---------------------------------------------------------------------------
 # Container exec wrapper
@@ -135,7 +211,7 @@ def verify_edit_files_exist(manifest: dict) -> None:
 def wipe_caches() -> None:
     """Wipe Quadrants and Mesa kernel caches inside the container.
 
-    Per project_context.md: every Genesis edit requires this or the cached compiled kernel
+    Per references/project_context.md: every Genesis edit requires this or the cached compiled kernel
     is reused and the patch silently no-ops.
     """
     rc, out = _docker_exec(
@@ -144,6 +220,53 @@ def wipe_caches() -> None:
     )
     if rc != 0:
         warn(f"cache wipe returned rc={rc}: {out[-300:]}")
+
+
+# ---------------------------------------------------------------------------
+# GPU clock pinning -- mitigates inter-trial variance from frequency scaling
+# ---------------------------------------------------------------------------
+# CDNA3 default perf level is "auto", which lets the GPU throttle based on
+# thermals and load. Across 3-trial benches that's a meaningful source of the
+# ~1% noise floor. Pinning to "high" before the bench and restoring after
+# typically halves inter-trial sigma. Safe noop if rocm-smi isn't available
+# (e.g., dev box without root inside container).
+
+def pin_gpu_clocks() -> str | None:
+    """Pin the agent's GPU to perf level 'high'. Returns the previous level
+    string for restore, or None if pinning failed (operation is best-effort)."""
+    gpu = os.environ.get("AUTOKERNEL_GPU_ID", "0")
+    # Read current level (parse rocm-smi --showperflevel output)
+    rc, out = _docker_exec(
+        f"rocm-smi -d {gpu} --showperflevel 2>&1 || true",
+        timeout=15,
+    )
+    prev = None
+    if rc == 0:
+        m = re.search(r"Performance Level[^:]*:\s*(\w+)", out)
+        if m:
+            prev = m.group(1)
+    rc2, out2 = _docker_exec(
+        f"rocm-smi -d {gpu} --setperflevel high 2>&1 || true",
+        timeout=15,
+    )
+    if rc2 == 0 and "ERROR" not in out2.upper() and "Permission" not in out2:
+        print(f"bench: pinned GPU{gpu} clocks to 'high' (was '{prev or 'unknown'}')")
+        return prev or "auto"
+    warn(f"could not pin GPU{gpu} clocks (rocm-smi unavailable or no permission); "
+         f"trial variance may be elevated")
+    return None
+
+
+def restore_gpu_clocks(prev: str | None) -> None:
+    """Restore GPU perf level. No-op if pin_gpu_clocks failed."""
+    if prev is None:
+        return
+    gpu = os.environ.get("AUTOKERNEL_GPU_ID", "0")
+    _docker_exec(
+        f"rocm-smi -d {gpu} --setperflevel {prev} 2>&1 || true",
+        timeout=15,
+    )
+    print(f"bench: restored GPU{gpu} perf level to '{prev}'")
 
 
 def run_correctness(manifest: dict) -> tuple[str, str]:
@@ -169,13 +292,9 @@ def run_correctness(manifest: dict) -> tuple[str, str]:
     return "FAIL", f"rc={rc}\n{out[-800:]}"
 
 
-def run_untraced_bench(out_dir: str) -> dict:
-    """Run /work/bench_mi300.py untraced for headline e2e numbers.
-
-    bench_mi300.py is the team's purpose-built single-config harness (vs benchmark_scaling.py
-    which sweeps multiple n_envs and writes to a fixed path). Faster for our iteration loop.
-    """
-    json_out = f"{out_dir}/untraced.json"
+def _run_untraced_trial(out_dir: str, trial_idx: int) -> dict:
+    """Run a SINGLE untraced trial. Returns dict with status + throughput/wall on PASS."""
+    json_out = f"{out_dir}/untraced_t{trial_idx}.json"
     cmd = (
         f"mkdir -p {out_dir} && "
         f"GS_FAST_MATH=0 "
@@ -185,7 +304,7 @@ def run_untraced_bench(out_dir: str) -> dict:
         f"--precision {DEFAULT_PRECISION} "
         f"--n-envs {DEFAULT_NENVS} "
         f"--num-steps {DEFAULT_E2E_NSTEPS} "
-        f"--tag untraced "
+        f"--tag untraced_t{trial_idx} "
         f"--out {json_out} 2>&1 | tail -30"
     )
     t0 = time.time()
@@ -197,13 +316,10 @@ def run_untraced_bench(out_dir: str) -> dict:
     if rc != 0:
         return {"status": "CRASH", "wall_seconds": dt, "log_tail": out[-1500:]}
 
-    # Try to parse the JSON. benchmark_scaling.py writes a list of entries; the 8192-env
-    # entry is the one we want.
     parsed = _read_json_in_container(json_out)
     if parsed is None:
         return {"status": "PARSE_FAIL", "wall_seconds": dt, "log_tail": out[-800:]}
 
-    # bench_mi300.py writes a single dict (not a list), with keys: throughput, wall_time_s, n_envs, ...
     entry = parsed if isinstance(parsed, dict) else _select_8192_entry(parsed)
     if entry is None:
         return {"status": "PARSE_FAIL", "wall_seconds": dt, "log_tail": out[-800:],
@@ -217,6 +333,63 @@ def run_untraced_bench(out_dir: str) -> dict:
         "e2e_wall_seconds": float(wall),
         "wall_seconds": dt,
         "log_tail": out[-200:],
+    }
+
+
+def run_untraced_bench(out_dir: str, n_trials: int = DEFAULT_TRIALS,
+                       wipe_between: bool = True) -> dict:
+    """Run N untraced trials and report mean/sigma.
+
+    Why N trials: at the documented ~1% noise floor, single-trial results
+    routinely produce false KEEPs and false REVERTs. Mean over N>=3 with sigma
+    enables a 2-sigma KEEP rule that actually distinguishes signal from noise.
+
+    `wipe_between=True` clears the kernel cache before EACH trial so we measure
+    cold-cache compile + steady-state separately. Set False to amortize compile.
+    """
+    samples: list[float] = []
+    walls: list[float] = []
+    total_wall = 0.0
+    last_log_tail = ""
+    last_status = "PASS"
+
+    for i in range(max(1, n_trials)):
+        if wipe_between and i > 0:
+            # Re-wipe so each trial sees the same cold-cache scenario as trial 0
+            wipe_caches()
+        print(f"bench:   trial {i+1}/{n_trials}...")
+        r = _run_untraced_trial(out_dir, i)
+        total_wall += r.get("wall_seconds", 0.0)
+        last_log_tail = r.get("log_tail", "")
+        if r["status"] != "PASS":
+            last_status = r["status"]
+            # Abort multi-trial on first hard failure -- one bad trial means
+            # the change is broken; no point spending budget on more.
+            return {
+                "status": r["status"],
+                "wall_seconds": total_wall,
+                "log_tail": last_log_tail,
+                "trials_completed": i,
+            }
+        samples.append(r["e2e_throughput"])
+        walls.append(r["e2e_wall_seconds"])
+        print(f"bench:   trial {i+1}: e2e={r['e2e_throughput']:.0f} wall={r['e2e_wall_seconds']:.2f}s")
+
+    mean = statistics.mean(samples)
+    sigma = statistics.stdev(samples) if len(samples) >= 2 else 0.0
+    sigma_pct = (100.0 * sigma / mean) if mean else 0.0
+    wall_mean = statistics.mean(walls)
+
+    return {
+        "status": "PASS",
+        "e2e_throughput": mean,
+        "e2e_throughput_sigma": sigma,
+        "e2e_throughput_sigma_pct": sigma_pct,
+        "e2e_throughput_n": len(samples),
+        "e2e_throughput_samples": samples,
+        "e2e_wall_seconds": wall_mean,
+        "wall_seconds": total_wall,
+        "log_tail": last_log_tail,
     }
 
 
@@ -369,7 +542,11 @@ def warn(msg: str) -> None:
 def print_contract(*, correctness: str, kernel_avg_us: float, kernel_total_ms: float,
                    kernel_calls: int, e2e_throughput: float, e2e_wall_seconds: float,
                    peak_vram_mb: float, profile_overhead_pct: float,
-                   top_5: list[tuple[str, float, float]]) -> None:
+                   top_5: list[tuple[str, float, float]],
+                   e2e_throughput_sigma: float = 0.0,
+                   e2e_throughput_sigma_pct: float = 0.0,
+                   e2e_throughput_n: int = 1,
+                   e2e_throughput_samples: list[float] | None = None) -> None:
     print()
     print("---")
     print(f"correctness:        {correctness}")
@@ -377,6 +554,9 @@ def print_contract(*, correctness: str, kernel_avg_us: float, kernel_total_ms: f
     print(f"kernel_total_ms:    {kernel_total_ms:.2f}")
     print(f"kernel_calls:       {kernel_calls}")
     print(f"e2e_throughput:     {e2e_throughput:.0f}")
+    print(f"e2e_throughput_sigma: {e2e_throughput_sigma:.1f}")
+    print(f"e2e_throughput_sigma_pct: {e2e_throughput_sigma_pct:.3f}")
+    print(f"e2e_throughput_n:   {e2e_throughput_n}")
     pct = (100.0 * e2e_throughput / H100_THROUGHPUT_REF) if H100_THROUGHPUT_REF else 0.0
     print(f"e2e_pct_of_h100:    {pct:.2f}")
     print(f"e2e_wall_seconds:   {e2e_wall_seconds:.3f}")
@@ -384,6 +564,9 @@ def print_contract(*, correctness: str, kernel_avg_us: float, kernel_total_ms: f
     vpct = (100.0 * peak_vram_mb / (192 * 1024)) if peak_vram_mb else 0.0
     print(f"peak_vram_pct:      {vpct:.1f}")
     print(f"profile_overhead_pct: {profile_overhead_pct:.1f}")
+    if e2e_throughput_samples and len(e2e_throughput_samples) > 1:
+        sample_str = ", ".join(f"{s:.0f}" for s in e2e_throughput_samples)
+        print(f"e2e_throughput_samples: [{sample_str}]")
     if top_5:
         print()
         print("top_5_kernels (post init-strip):")
@@ -404,6 +587,13 @@ def main() -> int:
                     help="WARNING: skip pytest. For dev/debug only.")
     ap.add_argument("--profile-omniperf", action="store_true",
                     help="run omniperf profile in addition (slow, for stuck campaigns)")
+    ap.add_argument("--trials", type=int, default=DEFAULT_TRIALS,
+                    help=f"untraced trials (default {DEFAULT_TRIALS}); >=2 enables sigma reporting")
+    ap.add_argument("--no-wipe-between-trials", action="store_true",
+                    help="reuse cached compile across trials (faster, but conflates compile+steady-state)")
+    ap.add_argument("--no-rubric-check", action="store_true",
+                    help="bypass the B1.5 three-question rubric enforcement on the HEAD commit "
+                         "(use only for explicit out-of-band runs)")
     args = ap.parse_args()
 
     # Sanity
@@ -415,6 +605,9 @@ def main() -> int:
 
     manifest = load_manifest(args.campaign)
     verify_edit_files_exist(manifest)
+
+    # Forcing-function gate: refuse to bench an ill-formed hypothesis commit.
+    check_rubric_or_die(skip=args.no_rubric_check)
 
     print(f"bench: campaign={args.campaign} container={container} gpu={os.environ.get('AUTOKERNEL_GPU_ID', '?')}")
     print(f"bench: editing genesis at {_genesis_src()}")
@@ -445,9 +638,21 @@ def main() -> int:
     run_id = time.strftime("%Y%m%d-%H%M%S")
     out_dir_in_container = f"/work/runs/{args.campaign}-{run_id}"
 
-    # Step 3: untraced bench (headline e2e)
-    print("bench: untraced run (8192/500/FP32)...")
-    untraced = run_untraced_bench(out_dir_in_container)
+    # Step 3: untraced bench (headline e2e) -- N trials for variance estimate.
+    # Pin GPU clocks for the duration of the WHOLE bench (untraced + traced) to
+    # reduce inter-trial frequency-scaling noise. Use atexit so the restore
+    # fires on every exit path (early return, exception, sys.exit) without
+    # forcing us to re-indent the whole bench body in a try/finally.
+    import atexit
+    prev_perf = pin_gpu_clocks()
+    atexit.register(restore_gpu_clocks, prev_perf)
+
+    print(f"bench: untraced run x{args.trials} (8192/500/FP32)...")
+    untraced = run_untraced_bench(
+        out_dir_in_container,
+        n_trials=args.trials,
+        wipe_between=not args.no_wipe_between_trials,
+    )
     if untraced["status"] != "PASS":
         print(f"bench: untraced {untraced['status']} -- {untraced.get('log_tail', '')}")
         print_contract(
@@ -458,9 +663,14 @@ def main() -> int:
         )
         return 0
     e2e_thr = untraced["e2e_throughput"]
+    e2e_thr_sigma = untraced.get("e2e_throughput_sigma", 0.0)
+    e2e_thr_sigma_pct = untraced.get("e2e_throughput_sigma_pct", 0.0)
+    e2e_thr_n = untraced.get("e2e_throughput_n", 1)
+    e2e_thr_samples = untraced.get("e2e_throughput_samples", [e2e_thr])
     e2e_wall = untraced["e2e_wall_seconds"]
     untraced_walltime = untraced["wall_seconds"]
-    print(f"bench: untraced e2e_throughput={e2e_thr:.0f} env*steps/s, wall={e2e_wall:.2f}s")
+    print(f"bench: untraced e2e mean={e2e_thr:.0f} sigma={e2e_thr_sigma:.0f} ({e2e_thr_sigma_pct:.2f}%) "
+          f"n={e2e_thr_n} wall_total={untraced_walltime:.1f}s")
 
     # Step 4: traced bench (per-kernel attribution)
     if args.skip_traced:
@@ -493,10 +703,15 @@ def main() -> int:
                 kernel_total_ms = stats["primary_total_ns"] / 1e6
                 kernel_calls = stats["primary_calls"]
                 top_5 = stats["top_5_kernels"]
-            # Estimate rocprofv3 overhead: traced is N/500 of the steps, scale to compare.
+            # Estimate rocprofv3 overhead: traced is N/500 of the steps, scale to compare
+            # against the *per-trial* untraced wall (not the multi-trial sum).
             traced_wall = traced["wall_seconds"]
             scaled = traced_wall * (DEFAULT_E2E_NSTEPS / DEFAULT_PROF_NSTEPS)
-            prof_overhead = max(0.0, 100.0 * (scaled - untraced_walltime) / max(untraced_walltime, 1e-6))
+            untraced_per_trial = untraced_walltime / max(e2e_thr_n, 1)
+            prof_overhead = max(
+                0.0,
+                100.0 * (scaled - untraced_per_trial) / max(untraced_per_trial, 1e-6),
+            )
 
     peak_vram = _peak_vram_mb_in_container() or 0.0
 
@@ -506,6 +721,10 @@ def main() -> int:
         kernel_total_ms=kernel_total_ms,
         kernel_calls=kernel_calls,
         e2e_throughput=e2e_thr,
+        e2e_throughput_sigma=e2e_thr_sigma,
+        e2e_throughput_sigma_pct=e2e_thr_sigma_pct,
+        e2e_throughput_n=e2e_thr_n,
+        e2e_throughput_samples=e2e_thr_samples,
         e2e_wall_seconds=e2e_wall,
         peak_vram_mb=peak_vram,
         profile_overhead_pct=prof_overhead,

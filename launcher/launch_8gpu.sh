@@ -47,7 +47,10 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
   echo "image $IMAGE not found locally" >&2; exit 1; }
 
 DATE_TAG="$(date +%b%d | tr A-Z a-z)"
-mkdir -p "$AUTOKERNEL_ROOT/ak-wt" "$AUTOKERNEL_ROOT/genesis-wt" "$AUTOKERNEL_ROOT/cache"
+SHARED_DIR="${AUTOKERNEL_SHARED_DIR:-$AUTOKERNEL_ROOT/autokernels-shared}"
+mkdir -p "$AUTOKERNEL_ROOT/ak-wt" "$AUTOKERNEL_ROOT/genesis-wt" "$AUTOKERNEL_ROOT/cache" "$SHARED_DIR"
+# Initialize the shared cross-agent log so all 8 agents can flock-append to it
+AUTOKERNEL_SHARED_DIR="$SHARED_DIR" python3 "$AK_REPO/global_log.py" init >/dev/null || true
 
 assign_campaign() {
   local i=$1
@@ -107,6 +110,7 @@ for ((i=0; i<NUM_GPUS; i++)); do
       -e PYOPENGL_PLATFORM=egl -e EGL_PLATFORM=surfaceless -e PYGLET_HEADLESS=true \
       -e CAMPAIGN="$CAMPAIGN" \
       -e AUTOKERNEL_GPU_ID="$i" \
+      -e AUTOKERNEL_SHARED_DIR="$SHARED_DIR" \
       -v "$GEN_WT":/src/Genesis \
       -v "$QUADRANTS_REPO":/src/quadrants:ro \
       -v "$NEWTON_ASSETS":/src/newton-assets:ro \
@@ -129,5 +133,6 @@ for ((i=0; i<NUM_GPUS; i++)); do
   echo "  GPU ${i} (${CAMPAIGN}): cd $AK_WT && \\"
   echo "    AUTOKERNEL_GPU_ID=$i AUTOKERNEL_CONTAINER=ak-gpu${i} \\"
   echo "    GENESIS_SRC=$AUTOKERNEL_ROOT/genesis-wt/gpu${i} CAMPAIGN=$CAMPAIGN \\"
+  echo "    AUTOKERNEL_SHARED_DIR=$SHARED_DIR \\"
   echo "    claude code   # or: codex"
 done

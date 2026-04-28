@@ -1,74 +1,115 @@
 # autokernels-genesis
 
-Autoresearch for Genesis-on-MI300X kernels. A targeted fork of [RightNow-AI/autokernel](https://github.com/RightNow-AI/autokernel) (which itself is the kernel-domain port of [karpathy/autoresearch](https://github.com/karpathy/autoresearch)), specialized for two Genesis kernel campaigns on 8× AMD Instinct MI300X.
+Autonomous LLM-driven research loop for AMD GPU kernel optimization. Targets the [Genesis](https://github.com/Genesis-Embodied-AI/Genesis) physics simulator on 8× AMD Instinct MI300X.
 
-## What this is
+A coding agent (Claude Code, Codex) reads `program.md`, picks a kernel campaign, edits Genesis Python source, runs a multi-trial benchmark inside a pinned-GPU container, parses per-kernel rocprofv3 stats and end-to-end throughput, then keeps the change only if it survives a 2-sigma improvement test. Loops indefinitely. Eight agents work in parallel, sharing a cross-agent loss log so they avoid duplicate dead-ends.
 
-A coding agent (Claude Code, Codex) reads `program.md`, picks one of two campaigns (`func_broad_phase` or `kernel_step_1_2`), edits Genesis Python source for the targeted kernel, runs the harness on a pinned GPU inside the `genesis:amd-integration` container, parses the per-kernel rocprofv3 stats + end-to-end throughput, then keeps or reverts. Loops forever. 8 agents on 8 GPUs by default.
+## Highlights
 
-## Directory shape
+- **Indefinite autonomous loop.** No code-level stop condition; only human SIGINT or watchdog HALT exits.
+- **Multi-trial 2-sigma KEEP rule.** Three trials per experiment with sigma reporting, paired with GPU clock pinning to halve inter-trial variance. KEEP rule is disjunctive — any single significant signal qualifies.
+- **B1.5 forcing-function rubric.** Every hypothesis commit must include three lines: dominant bottleneck, smallest change, prior probability. `bench.py` enforces the rubric at the gate.
+- **Cross-agent shared learning.** All 8 agents append to a flock-locked global log; each iteration reads a digest of recent KEEPs and dead-end classes from siblings.
+- **Per-class success memory.** `summarize.py` distills `results.tsv` into `workspace/learning.md` so the next iteration sees what's worked and what hasn't.
+- **Cross-agent statistical drift HALT.** Watchdog detects infrastructure drift by monitoring KEEP-throughput trends across all GPUs.
+
+## Architecture
 
 ```
 autokernels-genesis/
-├── program.md                          the agent's operating manual
-├── project_context.md                    the project/baseline/target numbers (frozen)
-├── mi300x_notes.md                     CDNA3 / gfx942 hardware cheatsheet (frozen)
-├── prepare.py                          ROCm + container check, variance calibration, baseline capture
-├── bench.py                            FROZEN: runs benchmark_scaling.py inside container, parses
-│                                       rocprofv3 stats, prints greppable contract
-├── correctness.py                      FROZEN: scoped pytest subset for each campaign
-├── orchestrate.py                      decides which campaign + when to move on (Amdahl)
-├── verify.py                           full acceptance gate (full pytest + 8192/500 e2e)
-├── analysis.py                         morning dashboard (results.tsv → progress.png)
-├── kernels/
+├── program.md                  agent operating manual (the prompt)
+├── prepare.py                  one-time env check + variance calibration
+├── bench.py                    multi-trial bench + sigma + clock pin + rubric gate
+├── correctness.py              scoped pytest subset per campaign
+├── verify.py                   full acceptance gate (full pytest + e2e)
+├── orchestrate.py              advisory campaign-state tracker
+├── summarize.py                results.tsv -> workspace/learning.md
+├── global_log.py               cross-agent shared loss log
+├── watchdog.py                 indefinite-run safety daemon
+├── analysis.py                 morning dashboard (results.tsv -> progress.png)
+├── references/                 frozen reference material (consult on demand)
+│   ├── index.md
+│   ├── project_context.md        baselines, top-8 kernel gap, shipped patterns
+│   └── mi300x_notes.md         CDNA3 / gfx942 hardware cheatsheet
+├── kernels/                    per-campaign manifests
 │   ├── func_broad_phase/
-│   │   ├── target.json                 file paths + line ranges + correctness scope
-│   │   └── playbook.md                 ideas seeded from project tracker (TICKET)
-│   └── kernel_step_1_2/
-│       ├── target.json
-│       └── playbook.md
+│   ├── kernel_step_1_2/
+│   └── func_solve_body_monolith/
 ├── launcher/
-│   ├── launch_8gpu.sh                  spawn 8 docker containers + 8 git worktrees
-│   └── docker_run.sh                   single-container template
-└── workspace/                          gitignored: per-experiment runs, profiles, plan.json
+│   ├── launch_8gpu.sh          spawn 8 docker containers + worktrees
+│   └── docker_run.sh           single-container template
+└── workspace/                  gitignored runtime artifacts
 ```
 
-## Quick start (host)
+## Requirements
+
+- Linux x86_64
+- Docker 20+
+- ROCm 6.x with `rocminfo`, `rocm-smi`, `rocprofv3`
+- 8× AMD Instinct MI300X (or 1× for single-GPU smoke)
+- Python 3.10+ with [`uv`](https://github.com/astral-sh/uv)
+- A `genesis:amd-integration` Docker image with Genesis + Quadrants installed
+- Local checkouts of [Genesis](https://github.com/Genesis-Embodied-AI/Genesis), Quadrants, newton-assets at `~/work/`
+
+## Installation
 
 ```bash
-# 0. Verify hardware + repos exist
-rocminfo | grep -E "Marketing Name:|Compute Unit:|Wavefront Size:" | head -6
-ls ~/work/Genesis ~/work/quadrants ~/work/newton-assets
-
-# 1. One-time setup (env check + baseline capture + variance calibration)
-uv run prepare.py
-
-# 2. Smoke a single campaign on GPU 0
-HIP_VISIBLE_DEVICES=0 GENESIS_SRC=$HOME/work/Genesis uv run bench.py --campaign func_broad_phase
-
-# 3. Spawn 8 parallel agents (default split: 4 broad_phase + 4 step_1_2)
-launcher/launch_8gpu.sh
-
-# 4. Then point Claude Code or Codex at the autokernels-genesis worktree for each branch:
-#    cd ~/work/ak-wt/gpu0 && claude code
-#    "Read program.md and project_context.md, then run setup."
+git clone https://github.com/lohiaj/autokernels-genesis.git
+cd autokernels-genesis
+uv sync
 ```
 
-## Constraints (hard)
+## Usage
 
-1. **Edit only the files in the campaign's `target.json`.** Tests, harness, baseline numbers, benchmark_scaling.py are all frozen.
-2. **Clear `/root/.cache/quadrants` and `/root/.cache/mesa_shader_cache` after every Genesis edit** (`bench.py` does this for you — never bypass).
-3. **Correctness must pass** before performance is measured. `bench.py` aborts before timing if the scoped pytest subset fails.
-4. **Keep on improvement only**, where "improvement" = e2e throughput up by ≥ calibrated noise floor (see `prepare.py`) AND the targeted kernel's avg_us went down. Otherwise revert.
-5. **Per-GPU containers, per-GPU caches.** Never share `/root/.cache/quadrants` across containers.
-6. **NEVER STOP.** The loop is autonomous. Don't ask the human "should I continue?".
+See [USAGE.md](USAGE.md) for the full agent workflow. Quick start:
 
-## Inheritance
+```bash
+# 1. One-time environment check + variance calibration
+uv run prepare.py
 
-Code patterns adopted from `autokernel`: 5-stage correctness shape, `KERNEL_CONFIGS` per-kernel tolerance table pattern, `MOVE_ON_CRITERIA` orchestrator constants, greppable `key:` contract, TSV-per-branch + `analysis.py` morning dashboard, the Phase A/B/C `program.md` skeleton, the numbered Constraints section style.
+# 2. Single-GPU smoke against an existing container
+HIP_VISIBLE_DEVICES=0 \
+AUTOKERNEL_CONTAINER=ak-gpu0 \
+GENESIS_SRC=$HOME/work/Genesis \
+uv run bench.py --campaign func_broad_phase --no-rubric-check
 
-What we replaced: profile→extract pipeline (we have hand-curated targets); generic ML kernel library (we have two physics campaigns); single-GPU loop (we have an 8× MI300X launcher); PyTorch reference oracle (we use scoped pytest + e2e regression as the oracle); NVIDIA-only optimization tiers (replaced with CDNA3/MI300X tiers in `mi300x_notes.md`).
+# 3. Spawn 8 parallel agents (default: 4 broad_phase + 4 step_1_2)
+launcher/launch_8gpu.sh
+
+# 4. Start the watchdog (separate process)
+nohup uv run watchdog.py --loop --interval 300 --campaign $CAMPAIGN \
+  > workspace/watchdog.log 2>&1 &
+
+# 5. Point an agent at each worktree (one per GPU):
+cd ~/work/ak-wt/gpu0 && claude code  # then: "Read program.md, then run setup."
+```
+
+## How the loop works
+
+Each agent runs a 10-step cycle until SIGINT or HALT:
+
+1. Check `workspace/HALT.flag`; exit cleanly if present.
+2. Read state: `learning.md`, `ideas-$CAMPAIGN.md`, cross-agent digest.
+3. Form one focused hypothesis (must answer the B1.5 three-question rubric).
+4. Edit one Genesis file from `target.json::edit_files`.
+5. Commit with the rubric in the message body.
+6. Run `bench.py --trials 3` (multi-trial untraced + traced rocprofv3, GPU clocks pinned).
+7. Parse the contract.
+8. Decide via B2 disjunctive 2σ KEEP rule.
+9. Record locally + globally; refresh `learning.md`.
+10. Loop.
+
+Full prompt (the operating manual the agent reads) is in [`program.md`](program.md).
+
+## Output
+
+After an overnight run the agent produces:
+
+- `results.tsv` — every experiment with metrics and status (30-100 rows per GPU)
+- A campaign branch (`perf/jlohia/$TAG`) on the Genesis repo with kept commits stacked
+- `workspace/learning.md` — per-class success rates and dead-end list
+- `workspace/compiler_proposals.md` — compiler-layer hypotheses for human review
 
 ## License
 
-MIT (inherited from the autokernel parent).
+MIT — see [LICENSE](LICENSE).

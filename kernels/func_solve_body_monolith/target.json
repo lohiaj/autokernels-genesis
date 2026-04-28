@@ -1,0 +1,34 @@
+{
+  "campaign_id": "func_solve_body_monolith",
+  "description": "THE dominant kernel: func_solve_body_monolith_c???_?_kernel_1_range_for. ~54% of GPU time on the the production benchmark. Per the team analysis (h100_vs_mi300x_kernel_comparison.txt) this single kernel accounts for ~56% of the H100<->MI300X gap. Compiler-layer fix already shipped (AccVGPR + global_load via codegen pass, TICKET/4420). DSL-layer optimization is the next lever and lives in func_solve_iter and its callees, which are all inlined into this monolith kernel by Quadrants.",
+  "tracker_ticket": "TICKET (current) + TICKET/4420 (compiler patch shipped)",
+  "owner_human": "(redacted) + (redacted) (compiler), jlohia + agent (DSL)",
+  "current_pct_of_h100": 67.05,
+  "target_pct_of_h100": 100.0,
+  "baseline_kernel_avg_us": 16940.0,
+  "primary_kernel_pattern": "^func_solve_body_monolith_c\\d+_\\d+_kernel_\\d+",
+  "kernel_per_call_h100_us": 6523.3,
+  "kernel_per_call_mi300x_baseline_us": 22027.5,
+  "edit_files": [
+    {
+      "path": "genesis/engine/solvers/rigid/constraint/solver.py",
+      "rationale": "func_solve_body_monolith itself (~line 3160), func_solve_iter (~3067), func_linesearch_batch (~2432), func_update_constraint_batch (~2625), func_update_gradient_batch (~2731), func_terminate_or_update_descent_batch (~2846), func_solve_init (~2940), and the func_ls_init_*/func_ls_point_fn_* helpers. ALL of these get inlined into the monolith kernel by Quadrants."
+    },
+    {
+      "path": "genesis/engine/solvers/rigid/abd/forward_dynamics.py",
+      "rationale": "func_solve_mass_batch / func_solve_mass_entity (the per-CG-iter Cholesky solve). Called from func_update_gradient_batch and inlined into the monolith kernel."
+    }
+  ],
+  "may_also_edit": [],
+  "do_not_edit": [
+    "tests/",
+    "benchmark_scaling.py",
+    "../quadrants/",
+    "genesis/engine/solvers/rigid/collider/"
+  ],
+  "correctness_tests": [
+    "tests/test_rigid_physics.py"
+  ],
+  "correctness_pytest_extra_args": "-k \"solver or constraint or rigid or not (test_convexify or test_mesh_repair or test_mesh_primitive_COM)\"",
+  "playbook_ref": "kernels/func_solve_body_monolith/playbook.md"
+}

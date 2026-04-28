@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-orchestrate.py -- decide what to optimize next + when to move on.
+orchestrate.py -- track campaign state + emit advisory signals.
 
 Reads/writes workspace/orchestration_state.json (initialized by prepare.py).
 
 Subcommands:
   uv run orchestrate.py status                                              -- print campaign state
-  uv run orchestrate.py next --campaign <id>                                -- CONTINUE | DONE
+  uv run orchestrate.py next --campaign <id>                                -- always CONTINUE (+stderr advisories)
+  uv run orchestrate.py recommend --campaign <id>                          -- print structured recommendations
   uv run orchestrate.py record --campaign <id> --kernel-avg-us X --e2e-throughput Y \
                                --status keep|revert|crash --description "..."
   uv run orchestrate.py report                                              -- write workspace/report.md
   uv run orchestrate.py reset                                               -- nuke state (use with care)
 
-Move-on criteria (configurable in workspace/orchestration_state.json::move_on_criteria):
-  - consecutive_reverts >= 8                  -> DONE
-  - experiments_run >= max_experiments        -> DONE
-  - current_pct_of_h100 >= kernel_pct_target  -> DONE (we're parity-ish)
+NOTE: As of the loop redesign, `next` NEVER returns DONE. The only legitimate
+stop is human SIGINT or the watchdog setting workspace/HALT.flag.
+The previous move-on criteria are now soft advisories printed to stderr.
 """
 
 from __future__ import annotations
@@ -88,28 +88,84 @@ def cmd_status(state: dict) -> None:
         print(f"               experiments={runs}  consecutive_reverts={reverts}")
 
 
+def _campaign_advisories(c: dict, crit: dict) -> list[str]:
+    """Compute non-blocking warnings for a campaign. Never causes a stop."""
+    out: list[str] = []
+    rev_warn = crit.get("warn_consecutive_reverts", 5)
+    rev_high = crit.get("consecutive_reverts", 8)
+    if c.get("consecutive_reverts", 0) >= rev_high:
+        out.append(
+            f"WARN consecutive_reverts={c['consecutive_reverts']} (>= {rev_high}). "
+            "Re-read workspace/learning.md, switch hypothesis class, or run --profile-omniperf."
+        )
+    elif c.get("consecutive_reverts", 0) >= rev_warn:
+        out.append(
+            f"NOTE consecutive_reverts={c['consecutive_reverts']}. Consider varying idea class."
+        )
+    if c.get("experiments_run", 0) >= crit.get("max_experiments_per_campaign", 80):
+        out.append(
+            f"NOTE experiments_run={c['experiments_run']}. Soft budget reached; keep going if EV remains positive."
+        )
+    if c.get("current_pct_of_h100", 0) >= crit.get("kernel_pct_target", 80.0):
+        out.append(
+            f"NOTE current_pct_of_h100={c['current_pct_of_h100']:.1f}% >= target. Additional gains compound."
+        )
+    return out
+
+
+def _halt_flag_path() -> Path:
+    return WORKSPACE / "HALT.flag"
+
+
 def cmd_next(state: dict, campaign_name: str) -> None:
+    """Always CONTINUE unless the watchdog has set HALT.flag.
+
+    Advisories print to stderr so the agent sees them but the contract on stdout
+    stays simple: 'CONTINUE' or 'HALT'.
+    """
     c = get_campaign(state, campaign_name)
     crit = state.get("move_on_criteria", {})
 
-    # Move-on rules (any one fires -> DONE)
-    if c.get("consecutive_reverts", 0) >= crit.get("consecutive_reverts", 8):
-        c["status"] = "done_plateau"
+    # Reflect optimizing status if not already
+    if c.get("status") in (None, "pending"):
+        c["status"] = "optimizing"
         save_state(state)
-        print("DONE  reason=plateau (8+ consecutive reverts)")
-        return
-    if c.get("experiments_run", 0) >= crit.get("max_experiments_per_campaign", 80):
-        c["status"] = "done_budget"
-        save_state(state)
-        print("DONE  reason=experiment_budget_exhausted")
-        return
-    if c.get("current_pct_of_h100", 0) >= crit.get("kernel_pct_target", 80.0):
-        c["status"] = "done_target"
-        save_state(state)
-        print("DONE  reason=kernel_pct_target_reached")
+
+    for line in _campaign_advisories(c, crit):
+        print(line, file=sys.stderr)
+
+    halt = _halt_flag_path()
+    if halt.exists():
+        try:
+            reason = halt.read_text().strip() or "watchdog set HALT.flag"
+        except OSError:
+            reason = "watchdog set HALT.flag (unreadable)"
+        print(f"HALT  reason={reason}", file=sys.stderr)
+        print("HALT")
         return
 
     print("CONTINUE")
+
+
+def cmd_recommend(state: dict, campaign_name: str) -> None:
+    """Structured recommendation for the agent (advisory only)."""
+    c = get_campaign(state, campaign_name)
+    crit = state.get("move_on_criteria", {})
+
+    print(f"campaign={campaign_name}")
+    print(f"experiments_run={c.get('experiments_run', 0)}")
+    print(f"consecutive_reverts={c.get('consecutive_reverts', 0)}")
+    print(f"current_pct_of_h100={c.get('current_pct_of_h100', 0):.2f}")
+    print(f"best_kernel_avg_us={c.get('best_kernel_avg_us')}")
+    print(f"best_e2e_throughput={c.get('best_e2e_throughput')}")
+    print()
+    advisories = _campaign_advisories(c, crit)
+    if not advisories:
+        print("status: healthy -- continue with playbook + ideas.md")
+    else:
+        print("advisories:")
+        for line in advisories:
+            print(f"  - {line}")
 
 
 def cmd_record(state: dict, *, campaign_name: str, kernel_avg_us: float,
@@ -185,6 +241,9 @@ def main() -> int:
     n = sub.add_parser("next")
     n.add_argument("--campaign", required=True)
 
+    rec = sub.add_parser("recommend")
+    rec.add_argument("--campaign", required=True)
+
     r = sub.add_parser("record")
     r.add_argument("--campaign", required=True)
     r.add_argument("--kernel-avg-us", type=float, required=True)
@@ -207,6 +266,8 @@ def main() -> int:
         cmd_status(state)
     elif args.cmd == "next":
         cmd_next(state, args.campaign)
+    elif args.cmd == "recommend":
+        cmd_recommend(state, args.campaign)
     elif args.cmd == "record":
         cmd_record(state, campaign_name=args.campaign,
                    kernel_avg_us=args.kernel_avg_us,
