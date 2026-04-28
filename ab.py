@@ -1366,8 +1366,11 @@ def cmd_jenkins_pin(args: argparse.Namespace) -> int:
             f"# recorded at {datetime.now(timezone.utc).isoformat()}\n"
             f"# source: {provenance}\n"
         )
-        is_jenkins_sourced = any(
-            s in provenance.lower()
+        # Detect by whether --provenance was explicitly given (the fallback string
+        # itself contains "jenkins" inside its warning text, which would falsely
+        # trip a substring check).
+        is_jenkins_sourced = bool(args.provenance) and any(
+            s in args.provenance.lower()
             for s in ("jenkins", "build #", "pinned-manifest", "aifoundry.amd.com"))
         if is_jenkins_sourced:
             print(f"jenkins-pin: wrote {args.pin} to {pin_file} (source: jenkins-authoritative)")
