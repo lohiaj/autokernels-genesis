@@ -83,6 +83,13 @@ DEFAULT_GPU_BUSY_THRESHOLD = 5.0       # spec 2.9: > 5% triggers wait
 DEFAULT_GPU_WAIT_MAX_S = 300           # spec 2.9: 5 min then abort
 DEFAULT_BASELINE_DRIFT_PCT = 15.0      # spec 2.2: > 15% from previous baseline = abort
 
+# spec 2.11: Quadrants-Jenkins parity
+DEFAULT_JENKINS_PIN_FILE = Path("/home/jlohia/work/v2-dev/research/quadrants-pin.txt")
+QUADRANTS_BANNER_RE = re.compile(r"\[Quadrants\][^\n]*?commit\s+([0-9a-f]+)", re.I)
+
+# spec 2.12: calibration cache TTL
+DEFAULT_CALIBRATION_TTL_HOURS = 24
+
 WORKSPACE = Path(__file__).resolve().parent / "workspace"
 
 
@@ -299,6 +306,226 @@ def check_merge_base_age(repo_dir: str, working_branch: str, prod_branch: str,
             f"is {age.total_seconds() / 3600:.1f}h old (> {max_age_h}h). "
             f"Rebase onto {prod_branch} before continuing, or pass --skip-merge-base-check "
             f"if you've explicitly verified your baseline is still representative.")
+
+
+# ---------------------------------------------------------------------------
+# 2.11: Quadrants-Jenkins parity
+# ---------------------------------------------------------------------------
+# The C2 disaster (2026-04-28): identical Genesis code measured +2.09% local
+# but -7.41% Jenkins because the local Quadrants had a cherry-picked commit
+# (`inline-range-for-body`, closed PR #19) that Jenkins's amd-integration
+# head didn't have. The cherry-pick changed whether func_update_constraint_batch
+# inlined into the monolith kernel, which controlled whether the C2 fusion
+# helped or hurt.
+#
+# Recording the local Quadrants commit (sec 2.10) wasn't enough -- the
+# harness must REFUSE to run an A/B if local Quadrants doesn't equal what
+# Jenkins's pre-submit pipeline uses for the production branch.
+
+def get_local_quadrants_commit() -> str | None:
+    """Parse the [Quadrants] commit XXXX banner that Quadrants prints to
+    stderr on import. Returns the short SHA, or None if not detected."""
+    container = os.environ.get("AUTOKERNEL_CONTAINER")
+    if not container:
+        warn("AUTOKERNEL_CONTAINER unset; can't detect local Quadrants commit "
+             "(non-Genesis project? skipping parity check)")
+        return None
+    rc, out = _bench._docker_exec(
+        "python3 -c 'import quadrants' 2>&1 | head -3", timeout=20)
+    if rc != 0:
+        warn(f"could not import quadrants in {container}: {out[-300:]}")
+        return None
+    m = QUADRANTS_BANNER_RE.search(out)
+    if not m:
+        warn(f"could not parse Quadrants commit from import banner: {out[:300]}")
+        return None
+    return m.group(1).strip()
+
+
+def get_jenkins_quadrants_pin(pin_file: Path = DEFAULT_JENKINS_PIN_FILE) -> str | None:
+    """Read the cached Jenkins-pinned Quadrants commit. The pin file format:
+
+        <commit_sha>
+        # optional metadata lines (build URL, fetch timestamp, etc.)
+
+    Returns None if the file doesn't exist (caller decides whether to abort)."""
+    if not pin_file.exists():
+        return None
+    try:
+        for line in pin_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line
+    except OSError as e:
+        warn(f"could not read {pin_file}: {e}")
+    return None
+
+
+def assert_stack_aligned(skip: bool = False) -> dict:
+    """Verify local Quadrants commit == Jenkins-pinned commit. Returns a dict
+    suitable for embedding in trial JSON: {local, pinned, aligned, source}.
+    Aborts on mismatch unless skip=True."""
+    local = get_local_quadrants_commit()
+    pinned = get_jenkins_quadrants_pin()
+    info_dict = {
+        "local_quadrants_commit": local,
+        "jenkins_quadrants_commit": pinned,
+        "stack_aligned": False,
+        "pin_file": str(DEFAULT_JENKINS_PIN_FILE),
+    }
+    if local is None:
+        if not skip:
+            warn("local Quadrants commit unknown; treating as unaligned. "
+                 "Pass --skip-stack-check to bypass this check explicitly.")
+        return info_dict
+    if pinned is None:
+        if skip:
+            info_dict["stack_aligned"] = None
+            return info_dict
+        die(
+            f"QUADRANTS_VERSION_MISMATCH (no Jenkins pin available)\n"
+            f"  local Quadrants commit:  {local}\n"
+            f"  Jenkins pin file:        {DEFAULT_JENKINS_PIN_FILE} (missing)\n\n"
+            f"Cannot verify the local stack matches Jenkins's production stack. "
+            f"Either:\n"
+            f"  1. Populate {DEFAULT_JENKINS_PIN_FILE} with the Quadrants commit\n"
+            f"     from Jenkins's latest successful pre-submit pipeline build:\n"
+            f"       echo <jenkins_quadrants_commit_sha> > {DEFAULT_JENKINS_PIN_FILE}\n"
+            f"     (See: build.aifoundry.amd.com/job/genesis/job/pre-submit-amd-integration/ \n"
+            f"      → latest green build → pinned-manifest-genesis-rock7.11-...yml \n"
+            f"      → sources.repositories[name=quadrants].revision)\n"
+            f"  2. Run `uv run ab.py jenkins-pin --pin <sha>` to populate the cache.\n"
+            f"  3. Pass --skip-stack-check to bypass (NOT recommended; risks the C2-style\n"
+            f"     'looks great locally, regresses on Jenkins' failure mode)."
+        )
+    if not local.startswith(pinned[:8]) and not pinned.startswith(local[:8]):
+        if skip:
+            info_dict["stack_aligned"] = False
+            warn(f"QUADRANTS MISMATCH (skipping per --skip-stack-check): "
+                 f"local={local} jenkins={pinned}")
+            return info_dict
+        die(
+            f"QUADRANTS_VERSION_MISMATCH\n"
+            f"  local Quadrants commit:    {local}\n"
+            f"  Jenkins pin (production):  {pinned}\n\n"
+            f"This is the C2 failure mode: a local Quadrants cherry-pick that Jenkins\n"
+            f"doesn't have can flip a kernel's emit pattern (inlined vs outlined,\n"
+            f"register allocation, etc), turning a +2% local win into a -7% Jenkins\n"
+            f"regression on identical Genesis source.\n\n"
+            f"Resolve before running A/B:\n"
+            f"  1. Rebuild Quadrants against the Jenkins pin (~5-15 min on warm LLVM cache):\n"
+            f"     cd ~/work/quadrants && git fetch && git checkout {pinned}\n"
+            f"     <build + reinstall the wheel>\n"
+            f"  2. Or pull a prebuilt wheel matching {pinned} if your team publishes them.\n"
+            f"  3. Or pass --skip-stack-check to override (NOT recommended -- this is\n"
+            f"     exactly how the C2 disaster shipped)."
+        )
+    info_dict["stack_aligned"] = True
+    info(f"stack alignment OK: local Quadrants {local} matches Jenkins pin {pinned}")
+    return info_dict
+
+
+# ---------------------------------------------------------------------------
+# 2.12: Calibration A/B at session start
+# ---------------------------------------------------------------------------
+# Even with stack alignment, the local environment can drift in subtle ways
+# (kernel cache state, ROCm driver, GPU thermal envelope, ...). The harness
+# runs a known-good A/B as the first experiment of every session and confirms
+# the local result reproduces the Jenkins-known result for that change. If it
+# doesn't, the stack is mis-aligned somewhere -- abort before iterating on
+# anything new.
+#
+# Calibration target is configured per-project. For Genesis-on-MI300X the
+# canonical target is PR #34's B-only commit (Jenkins #99: ~+3.7% on
+# benchmark_scaling.py 8192-env G1+plane sweep vs amd-integration baseline).
+
+CALIBRATION_CACHE_FILE = WORKSPACE / "ab" / "calibration.json"
+
+
+def get_calibration_status(ttl_hours: int = DEFAULT_CALIBRATION_TTL_HOURS) -> dict | None:
+    """Read the most recent calibration result. Returns None if missing or
+    stale; the dict otherwise."""
+    if not CALIBRATION_CACHE_FILE.exists():
+        return None
+    try:
+        cache = json.loads(CALIBRATION_CACHE_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+    ts = cache.get("recorded_at")
+    if not ts:
+        return None
+    try:
+        recorded = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    age_h = (datetime.now(timezone.utc) - recorded).total_seconds() / 3600
+    if age_h > ttl_hours:
+        cache["stale"] = True
+        cache["age_hours"] = age_h
+    return cache
+
+
+def assert_calibration_passed(skip: bool = False,
+                              ttl_hours: int = DEFAULT_CALIBRATION_TTL_HOURS) -> dict:
+    """Aborts unless a recent (<= ttl_hours) calibration has passed. Returns
+    {pass, recorded_at, age_hours, expected, observed}."""
+    cal = get_calibration_status(ttl_hours)
+    if cal is None:
+        if skip:
+            return {"calibration_check_pass": None,
+                    "skipped": True, "reason": "--skip-calibration set"}
+        die(
+            f"CALIBRATION_REQUIRED\n"
+            f"No calibration A/B has been run, or the most recent one is stale "
+            f"(>{ttl_hours}h old). The harness will not run new candidates without "
+            f"first reproducing a known-good result on the local stack.\n\n"
+            f"Run: uv run ab.py calibrate\n\n"
+            f"Calibration target is configured per-project under "
+            f"harness.toml::calibration. Defaults are set for Genesis-on-MI300X "
+            f"PR #34 B-only.\n\n"
+            f"To bypass (NOT recommended; you will not detect stack drift): "
+            f"--skip-calibration."
+        )
+    if cal.get("stale"):
+        if skip:
+            warn(f"calibration is {cal.get('age_hours', 0):.1f}h stale; "
+                 f"running anyway per --skip-calibration")
+            return cal
+        die(
+            f"CALIBRATION_STALE\n"
+            f"The most recent calibration was {cal.get('age_hours', 0):.1f}h ago "
+            f"(> {ttl_hours}h TTL). Stack state may have drifted since then. "
+            f"Re-run: uv run ab.py calibrate"
+        )
+    if not cal.get("calibration_check_pass"):
+        if skip:
+            warn(f"calibration FAILED but proceeding per --skip-calibration; "
+                 f"reason: {cal.get('reason', '?')}")
+            return cal
+        die(
+            f"CALIBRATION_FAILED\n"
+            f"The most recent calibration A/B did not reproduce the expected "
+            f"known-good result.\n"
+            f"  expected median Δ: {cal.get('expected_median_delta_pct')}%\n"
+            f"  observed median Δ: {cal.get('observed_median_delta_pct')}%\n"
+            f"  reason: {cal.get('reason', '?')}\n\n"
+            f"This means your local stack does not reproduce Jenkins's known "
+            f"result for the calibration target. Do not iterate on new candidates "
+            f"until you reconcile the stack. Rebuild Quadrants or check "
+            f"AGENTS.md / methodology-fix-prompt.md §2.12."
+        )
+    info(f"calibration OK: observed Δ {cal.get('observed_median_delta_pct'):+.2f}% "
+         f"(expected {cal.get('expected_median_delta_pct'):+.2f}±"
+         f"{cal.get('tolerance_pct'):.2f}%, "
+         f"recorded {cal.get('age_hours', 0):.1f}h ago)")
+    return cal
+
+
+def record_calibration(result: dict) -> None:
+    """Persist calibration result so subsequent ab.py ab calls can read it."""
+    CALIBRATION_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    result["recorded_at"] = datetime.now(timezone.utc).isoformat()
+    CALIBRATION_CACHE_FILE.write_text(json.dumps(result, indent=2, default=str))
 
 
 # ---------------------------------------------------------------------------
@@ -674,8 +901,10 @@ def make_trial_record(arm: str, trial_idx: int, bench_result: dict,
                       base_commit: str, cand_commit: str, files: list[str],
                       base_hashes: dict, cand_hashes: dict, env_meta: dict,
                       gpu_busy_pre: float, num_steps: int, warmup: int,
+                      stack_info: dict | None = None,
+                      cal_status: dict | None = None,
                       noise_suspect: bool = False) -> dict:
-    """spec 2.10: full reproducibility footer."""
+    """spec 2.10: full reproducibility footer (incl. V2 stack/calibration fields)."""
     rec = {
         "tag": f"ab_{arm}_t{trial_idx}",
         "arm": arm,
@@ -698,6 +927,11 @@ def make_trial_record(arm: str, trial_idx: int, bench_result: dict,
             + "/Genesis/newton-assets/unitree_g1/urdf/g1_29dof.urdf"
         ),
         "quadrants_commit": env_meta.get("quadrants_commit", "?"),
+        # V2 spec 2.11 + 2.12: stack alignment + calibration provenance
+        "jenkins_quadrants_commit": (stack_info or {}).get("jenkins_quadrants_commit"),
+        "stack_aligned": (stack_info or {}).get("stack_aligned"),
+        "calibration_check_pass": (cal_status or {}).get("calibration_check_pass"),
+        "calibration_recorded_at": (cal_status or {}).get("recorded_at"),
         "rocm_version": env_meta.get("rocm_version", "?"),
         "host": env_meta.get("host", "?"),
         "hip_visible_devices": env_meta.get("hip_visible_devices", "?"),
@@ -819,6 +1053,18 @@ def cmd_ab(args: argparse.Namespace) -> int:
         check_merge_base_age(repo_dir, env_meta["genesis_branch"], args.prod_branch,
                              max_age_h=args.max_merge_base_age_h)
 
+    # spec 2.11: Quadrants-Jenkins parity. C2 disaster prevention.
+    # If --is-calibration: skip the calibration check (calibrate creates the cache).
+    # Always do the stack check: even calibration runs need an aligned stack.
+    stack_info = assert_stack_aligned(skip=args.skip_stack_check)
+
+    # spec 2.12: calibration must be passing+fresh before any non-calibration A/B.
+    if not getattr(args, "is_calibration", False):
+        cal_status = assert_calibration_passed(
+            skip=args.skip_calibration, ttl_hours=args.calibration_ttl_hours)
+    else:
+        cal_status = {"calibration_check_pass": "running_now"}
+
     # Output dir
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     out_dir = WORKSPACE / "ab" / f"{ts}-{args.name or 'ab'}"
@@ -872,7 +1118,8 @@ def cmd_ab(args: argparse.Namespace) -> int:
                                  num_steps=args.num_steps, warmup=args.bench_warmup)
             rec = make_trial_record("base", trial, r, base_commit, cand_commit, files,
                                     base_hashes, cand_hashes, env_meta, busy,
-                                    args.num_steps, args.bench_warmup)
+                                    args.num_steps, args.bench_warmup,
+                                    stack_info=stack_info, cal_status=cal_status)
             (trials_dir / f"base_t{trial}.json").write_text(json.dumps(rec, indent=2))
             base_trials.append(rec)
             info(f"  base[{trial}]: thr={r.get('throughput', 0):.0f}  "
@@ -892,7 +1139,8 @@ def cmd_ab(args: argparse.Namespace) -> int:
                                  num_steps=args.num_steps, warmup=args.bench_warmup)
             rec = make_trial_record("cand", trial, r, base_commit, cand_commit, files,
                                     base_hashes, cand_hashes, env_meta, busy,
-                                    args.num_steps, args.bench_warmup)
+                                    args.num_steps, args.bench_warmup,
+                                    stack_info=stack_info, cal_status=cal_status)
             (trials_dir / f"cand_t{trial}.json").write_text(json.dumps(rec, indent=2))
             cand_trials.append(rec)
             info(f"  cand[{trial}]: thr={r.get('throughput', 0):.0f}  "
@@ -1043,6 +1291,127 @@ def cmd_ab(args: argparse.Namespace) -> int:
 # Self-tests (spec section 4)
 # ---------------------------------------------------------------------------
 
+def cmd_jenkins_pin(args: argparse.Namespace) -> int:
+    """Manage the Jenkins-pinned Quadrants commit cache (spec 2.11).
+
+    Subcommand modes:
+      --pin <sha>    : write <sha> as the pinned commit
+      --show         : print current pinned + local commits side-by-side
+      --check        : exit 0 if local matches Jenkins pin, 2 otherwise
+    """
+    pin_file = DEFAULT_JENKINS_PIN_FILE
+    if args.pin:
+        pin_file.parent.mkdir(parents=True, exist_ok=True)
+        pin_file.write_text(
+            f"{args.pin}\n"
+            f"# recorded at {datetime.now(timezone.utc).isoformat()}\n"
+            f"# source: manual entry via `ab.py jenkins-pin --pin <sha>`\n"
+        )
+        print(f"jenkins-pin: wrote {args.pin} to {pin_file}")
+        return 0
+    if args.show or args.check:
+        local = get_local_quadrants_commit()
+        pinned = get_jenkins_quadrants_pin()
+        print(f"local Quadrants:    {local}")
+        print(f"Jenkins pin:        {pinned}")
+        print(f"pin file:           {pin_file} ({'exists' if pin_file.exists() else 'MISSING'})")
+        if args.check:
+            if local and pinned and (local.startswith(pinned[:8]) or pinned.startswith(local[:8])):
+                print("aligned: YES")
+                return 0
+            print("aligned: NO")
+            return 2
+        return 0
+    print("jenkins-pin: pass --pin <sha>, --show, or --check (see --help)",
+          file=sys.stderr)
+    return 1
+
+
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    """Run the calibration A/B (spec 2.12). Compares the configured calibration
+    target (default: PR #34 B-only commit on Genesis) against its baseline,
+    confirms the local result reproduces Jenkins's known result for that change.
+
+    On pass: writes calibration cache (24h TTL by default) so subsequent ab.py ab
+    calls skip this and proceed straight to candidate testing.
+
+    Configuration via harness.toml [calibration]:
+      target_branch / target_commit  : the known-good change to A/B
+      baseline_branch / baseline_commit
+      expected_median_delta_pct      : Jenkins-measured delta (e.g. +3.0)
+      tolerance_pct                  : acceptable bracket (e.g. 1.5)
+      min_sign_consistency           : e.g. 4 of 5 trials positive
+    """
+    # Calibration config: hardcoded defaults for Genesis-on-MI300X PR #34 B-only,
+    # overridable via CLI args. (We don't read harness.toml here -- keep simple
+    # for V2 first cut. Future: extend _config.py with a calibration block.)
+    target_branch = args.calibration_target_branch or "0c5bd5bd"  # PR #34 B-only
+    baseline_branch = args.calibration_baseline_branch or "release/0.4.4.amd1"
+    expected_pct = args.calibration_expected_pct
+    tolerance_pct = args.calibration_tolerance_pct
+    min_sign = args.calibration_min_sign
+
+    info(f"calibration: baseline={baseline_branch} target={target_branch}")
+    info(f"  expected median Δ ≈ {expected_pct:+.2f}% ± {tolerance_pct:.2f}%, "
+         f"sign consistency ≥ {min_sign}")
+
+    # Build a synthetic args.Namespace for cmd_ab with is_calibration=True
+    cal_args = argparse.Namespace(**vars(args))
+    cal_args.base = baseline_branch
+    cal_args.cand = target_branch
+    cal_args.name = "calibration"
+    cal_args.is_calibration = True
+    # Calibration doesn't recurse: it skips its own calibration check
+    cal_args.skip_calibration = True
+    # Run a slimmer config: skip rocprof to halve the time
+    cal_args.skip_traced = True
+
+    rc = cmd_ab(cal_args)
+    if rc != 0:
+        die("calibration A/B failed to complete; cannot record result")
+
+    # Read the most recent ab/<ts>-calibration/decision.json to assess pass/fail
+    cal_dirs = sorted((WORKSPACE / "ab").glob("*-calibration"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    if not cal_dirs:
+        die("could not locate calibration writeup dir")
+    decision = json.loads((cal_dirs[0] / "decision.json").read_text())
+    stats = decision.get("stats", {})
+    observed_pct = stats.get("median_delta_pct", 0.0)
+    sign_pos = stats.get("sign_pos", 0)
+    n = stats.get("n_trials", 0)
+
+    in_band = abs(observed_pct - expected_pct) <= tolerance_pct
+    sign_ok = sign_pos >= min_sign
+    passed = in_band and sign_ok
+
+    result = {
+        "calibration_check_pass": passed,
+        "expected_median_delta_pct": expected_pct,
+        "observed_median_delta_pct": observed_pct,
+        "tolerance_pct": tolerance_pct,
+        "sign_pos": sign_pos,
+        "sign_required": min_sign,
+        "n_trials": n,
+        "verdict": decision.get("verdict"),
+        "writeup": str(cal_dirs[0] / "summary.md"),
+        "reason": ("pass" if passed else
+                   f"observed Δ {observed_pct:+.2f}% outside expected "
+                   f"{expected_pct:+.2f}% ± {tolerance_pct:.2f}%; "
+                   f"sign {sign_pos}/{n} (required {min_sign})"),
+    }
+    record_calibration(result)
+
+    print()
+    print("=" * 72)
+    print(f"CALIBRATION: {'PASS' if passed else 'FAIL'}")
+    print(f"  expected median Δ = {expected_pct:+.2f}% ± {tolerance_pct:.2f}%")
+    print(f"  observed median Δ = {observed_pct:+.2f}%  (sign {sign_pos}/{n})")
+    print(f"  cached at: {CALIBRATION_CACHE_FILE}")
+    print("=" * 72)
+    return 0 if passed else 2
+
+
 def cmd_selftest_noop(args: argparse.Namespace) -> int:
     """Apply a whitespace-only patch, run ab, expect DISCARD/NEUTRAL with median Δ ≈ 0."""
     repo_dir = args.repo or os.environ.get("GENESIS_SRC")
@@ -1122,6 +1491,17 @@ def main() -> int:
                    help="production branch ref for merge-base age check (e.g. origin/release/0.4.4.amd1)")
     a.add_argument("--max-merge-base-age-h", type=int, default=24)
     a.add_argument("--skip-merge-base-check", action="store_true")
+    # V2 spec 2.11: stack alignment
+    a.add_argument("--skip-stack-check", action="store_true",
+                   help="bypass Quadrants-Jenkins parity check (NOT recommended; "
+                        "this is exactly how the C2 disaster shipped)")
+    # V2 spec 2.12: calibration
+    a.add_argument("--skip-calibration", action="store_true",
+                   help="bypass the calibration cache check (NOT recommended)")
+    a.add_argument("--calibration-ttl-hours", type=int,
+                   default=DEFAULT_CALIBRATION_TTL_HOURS,
+                   help=f"how long a calibration result remains valid "
+                        f"(default {DEFAULT_CALIBRATION_TTL_HOURS}h)")
 
     # selftest
     s = sub.add_parser("selftest-noop",
@@ -1149,8 +1529,64 @@ def main() -> int:
     s.add_argument("--prod-branch", default=None)
     s.add_argument("--name", default="selftest-noop")
 
+    # jenkins-pin
+    jp = sub.add_parser("jenkins-pin",
+                        help="manage the Jenkins-pinned Quadrants commit cache (spec 2.11)")
+    jp.add_argument("--pin", help="set the pinned commit SHA (writes to cache file)")
+    jp.add_argument("--show", action="store_true",
+                    help="show local + Jenkins pinned commits")
+    jp.add_argument("--check", action="store_true",
+                    help="exit 0 if aligned, 2 otherwise")
+
+    # calibrate
+    c = sub.add_parser("calibrate",
+                       help="run the calibration A/B (spec 2.12); "
+                            "must pass before any non-calibration ab.py ab")
+    # All the same A/B knobs:
+    for k, v in [
+        ("trials", DEFAULT_TRIALS), ("warmup_runs", DEFAULT_WARMUP_RUNS),
+        ("bench_warmup", DEFAULT_BENCH_WARMUP), ("num_steps", DEFAULT_NUM_STEPS),
+        ("rocprof_runs", DEFAULT_ROCPROF_RUNS),
+        ("traced_num_steps", DEFAULT_TRACED_NUM_STEPS),
+        ("min_median_delta_pct", DEFAULT_MIN_MEDIAN_DELTA_PCT),
+        ("sign_consistency_frac", DEFAULT_SIGN_CONSISTENCY_FRAC),
+        ("max_base_cov_pct", DEFAULT_MAX_BASE_COV_PCT),
+        ("amdahl_tolerance", DEFAULT_AMDAHL_TOLERANCE),
+        ("cross_kernel_regression_pct", DEFAULT_CROSS_KERNEL_REGRESSION_PCT),
+        ("gpu_busy_threshold", DEFAULT_GPU_BUSY_THRESHOLD),
+        ("gpu_wait_max_s", DEFAULT_GPU_WAIT_MAX_S),
+        ("max_merge_base_age_h", 24),
+        ("calibration_ttl_hours", DEFAULT_CALIBRATION_TTL_HOURS),
+    ]:
+        c.add_argument(f"--{k.replace('_', '-')}", default=v,
+                       type=type(v) if v is not None else str)
+    c.add_argument("--repo", default=None)
+    c.add_argument("--target-kernel", default=None)
+    c.add_argument("--name", default="calibration")
+    c.add_argument("--skip-traced", action="store_true", default=True)
+    c.add_argument("--skip-load-gate", action="store_true", default=False)
+    c.add_argument("--skip-stack-check", action="store_true", default=False)
+    c.add_argument("--prod-branch", default=None)
+    c.add_argument("--skip-merge-base-check", action="store_true", default=True)
+    # Calibration target params (default: PR #34 B-only on Genesis)
+    c.add_argument("--calibration-baseline-branch", default=None,
+                   help="baseline ref (default: release/0.4.4.amd1)")
+    c.add_argument("--calibration-target-branch", default=None,
+                   help="known-good target commit (default: 0c5bd5bd, PR #34 B-only)")
+    c.add_argument("--calibration-expected-pct", type=float, default=3.0,
+                   help="Jenkins-measured median Δ% (default: 3.0)")
+    c.add_argument("--calibration-tolerance-pct", type=float, default=1.5,
+                   help="acceptable bracket around expected (default: 1.5)")
+    c.add_argument("--calibration-min-sign", type=int, default=4,
+                   help="min trials with positive paired Δ (default: 4)")
+
     args = ap.parse_args()
-    return {"ab": cmd_ab, "selftest-noop": cmd_selftest_noop}[args.cmd](args)
+    return {
+        "ab": cmd_ab,
+        "selftest-noop": cmd_selftest_noop,
+        "jenkins-pin": cmd_jenkins_pin,
+        "calibrate": cmd_calibrate,
+    }[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -148,6 +148,32 @@ Initialize the result log and enter Phase B *immediately* — no waiting:
 printf "0\t$(git rev-parse --short HEAD)\t<baseline>\tbaseline\tinitial\n" >> results.tsv
 ```
 
+### A5b. Stack alignment + calibration (V2 gates — non-negotiable)
+
+Before any A/B can run, two gates must pass. `ab.py ab` will refuse to start until both succeed.
+
+```bash
+# 1. Stack alignment: local Quadrants must equal what Jenkins's pre-submit pipeline uses.
+#    The C2 disaster: identical Genesis code, +2.09% local vs -7.41% Jenkins, caused by
+#    a single cherry-picked Quadrants commit local had that Jenkins didn't.
+uv run ab.py jenkins-pin --check
+# If "aligned: NO": fetch the Jenkins pinned commit from
+#   build.aifoundry.amd.com -> latest green pre-submit build ->
+#   pinned-manifest-genesis-rock7.11-...yml -> sources.repositories[name=quadrants].revision
+# Then either:
+#   uv run ab.py jenkins-pin --pin <sha>    # cache the value
+#   cd ~/work/quadrants && git fetch && git checkout <sha> && <build>  # align local
+
+# 2. Calibration: reproduce a known-good Jenkins result on the local stack.
+#    Default target is PR #34 B-only (~+3.0% on Genesis G1 8192x500 fp32).
+uv run ab.py calibrate
+# If CALIBRATION_FAIL: the local stack does not reproduce Jenkins's known result.
+# Do not iterate on new candidates until you reconcile (typically rebuild Quadrants
+# against the pinned commit, then re-run calibrate).
+```
+
+Calibration cache TTL is 24 hours by default. Re-run `ab.py calibrate` once per day or after any Quadrants/ROCm/driver change.
+
 The only reasons to halt before Phase B (rare; cheap if they happen):
 
 1. **Source not found.** A1 grep returned zero matches across both sandboxes for `$KERNEL_NAME`. Print the candidates you considered, ask once, then proceed.
@@ -360,13 +386,16 @@ You read this at the top of every loop iteration. You append after every experim
 These were the methodological roots of past KEEP claims that didn't reproduce. The harness is designed to catch and refuse them; do not work around it.
 
 - ❌ "Bench A once, bench B once, compare ad-hoc %" — single-trial decisions of any kind, on any metric.
+- ❌ **Running A/Bs without first checking Quadrants–Jenkins parity** (`ab.py jenkins-pin --check`). This is the **C2 disaster** (2026-04-28): identical Genesis code, +2.09% local vs **−7.41% Jenkins** because of one cherry-picked Quadrants commit local had and Jenkins didn't. `ab.py ab` aborts with `QUADRANTS_VERSION_MISMATCH` if the gate isn't passed.
+- ❌ **Skipping the calibration A/B at session start** (`ab.py calibrate`). A first-class agent must reproduce a known-good Jenkins result on the local stack BEFORE iterating on new candidates. `ab.py ab` aborts with `CALIBRATION_REQUIRED` if no fresh (≤24h) calibration exists.
+- ❌ **Stacking local-only Quadrants cherry-picks**. If a Quadrants commit isn't on the same branch Jenkins's pre-submit pipeline pulls, treat it as off-limits for production-targeted A/Bs. (Fine to experiment; the result must be re-tested under the production Quadrants before being trusted.)
 - ❌ KEEP based on kernel-time alone. Kernel faster + E2E flat = `KERNEL_OK_E2E_FLAT` = DISCARD with that label, not KEEP.
 - ❌ Cache wipe between arms without symmetric warmup runs (asymmetric JIT cost).
 - ❌ Reporting % change without sign consistency, base CoV, AND paired delta.
 - ❌ "Within noise floor" without computing the actual noise floor for THIS session.
 - ❌ Comparing across builds with different Quadrants commits without rebenching the baseline.
-- ❌ Implicit baseline. Every result must explicitly name the base commit it was measured against (`ab.py` does this for you).
-- ❌ Using your own `prior(working): 0.65` as evidence to KEEP. Priors are fine for picking what to try; only paired E2E + rocprof + cross-kernel confirms KEEP.
+- ❌ Implicit baseline. Every result must explicitly name the base commit AND the Quadrants commit it was measured against (`ab.py` does this for you in the per-trial JSON footer).
+- ❌ Using your own `prior(working): 0.65` as evidence to KEEP. Priors are fine for picking what to try; only paired E2E + rocprof + cross-kernel + stack alignment + fresh calibration confirms KEEP.
 
 ## Per-experiment writeup format (in `learning.md`)
 
