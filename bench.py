@@ -106,6 +106,30 @@ def _head_commit_msg() -> str:
     return ""
 
 
+def _maybe_verify_sandbox() -> None:
+    """Run `sandbox.py verify` if a session is active. Halts with exit 2 on tamper.
+    Silent no-op if no session is active (e.g. manual bench outside a sandbox)."""
+    sandbox_py = Path(__file__).resolve().parent / "sandbox.py"
+    if not sandbox_py.exists():
+        return  # sandbox.py removed?
+    # Cheap check: does the session_state.json exist? If not, skip verify.
+    sandbox_dir = os.environ.get("AUTOKERNEL_SANDBOX")
+    if sandbox_dir:
+        state = Path(sandbox_dir) / "session_state.json"
+    else:
+        workspace_root = os.environ.get("AUTOKERNEL_ROOT") or os.path.expanduser("~/work")
+        state = Path(workspace_root) / ".cache" / "autokernels-genesis-sandbox" / "session_state.json"
+    if not state.exists():
+        return  # No active session; nothing to verify.
+
+    rc = subprocess.call([sys.executable, str(sandbox_py), "verify"])
+    if rc != 0:
+        # sandbox.py verify already printed a clear error to stderr.
+        die("sandbox tamper detected; refusing to bench. Re-run "
+            "`uv run sandbox.py setup --kernel <K>` after recovering, or pass "
+            "--no-sandbox-verify to bypass (NOT recommended).")
+
+
 def check_rubric_or_die(skip: bool) -> None:
     """Enforce the B1.5 forcing-function rubric on the HEAD commit message.
 
@@ -654,6 +678,9 @@ def main() -> int:
                     help="extract LLVM IR for kernels compiled during this bench (Move 37 escape "
                          "hatch -- gives the agent off-distribution compiler output to reason about). "
                          "See references/amdgcn_patterns.md for what to look for.")
+    ap.add_argument("--no-sandbox-verify", action="store_true",
+                    help="skip the pre-bench sandbox tamper check (sandbox.py verify). "
+                         "Use when running manually outside a sandbox session.")
     args = ap.parse_args()
 
     # Sanity
@@ -668,6 +695,12 @@ def main() -> int:
 
     # Forcing-function gate: refuse to bench an ill-formed hypothesis commit.
     check_rubric_or_die(skip=args.no_rubric_check)
+
+    # Bug 3 fix: detect mid-session sandbox tampering before running the bench.
+    # If the sandbox session_state.json exists, verify the expected branches are
+    # still checked out. Skipped if no session state (manual bench, no sandbox).
+    if not args.no_sandbox_verify:
+        _maybe_verify_sandbox()
 
     print(f"bench: campaign={args.campaign} container={container} gpu={os.environ.get('AUTOKERNEL_GPU_ID', '?')}")
     print(f"bench: editing genesis at {_genesis_src()}")

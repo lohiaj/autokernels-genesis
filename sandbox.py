@@ -15,12 +15,26 @@ Why this exists:
     runs.
 
 Subcommands:
-  uv run sandbox.py setup --kernel NAME    # ensure repos cloned + on session branch
+  uv run sandbox.py setup --kernel NAME    # clone repos + session branch + (if container) pip-swap
+  uv run sandbox.py teardown               # restore pip + clear session state (call at end of session)
+  uv run sandbox.py verify                 # check sandbox hasn't been tampered with by another agent
   uv run sandbox.py path --repo Genesis    # print the sandbox path for a repo
   uv run sandbox.py path --repo Quadrants  #
   uv run sandbox.py refresh                # fetch upstream, fast-forward release branches
   uv run sandbox.py status                 # show what's in the sandbox
   uv run sandbox.py wipe --yes             # nuke the sandbox (destructive)
+
+Bug 1 (pip-editable swap): on standard AMD perf VMs, the perf container has
+genesis-world installed pip-editable pointing at the user's main /work/Genesis.
+PYTHONPATH overrides don't beat editable installs, so the bench would silently
+run the user's main checkout while the agent edited the sandbox. `setup` now
+detects this and swaps the editable install to the sandbox; `teardown` restores.
+
+Bug 3 (sandbox tamper detection): on multi-tenant perf VMs, other agents' git
+operations can wander into our sandbox (e.g. `git -c safe.directory=*` checkout).
+`setup` writes a session state file recording the expected branch + pid + ts;
+`verify` checks the sandbox is still on the expected branch. bench.py calls
+`verify` before each bench and halts on mismatch.
 
 Env vars (with defaults):
   AUTOKERNEL_SANDBOX            ~/.cache/autokernels-genesis/sandbox
@@ -38,11 +52,14 @@ release branch and creates a new session branch.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 # IMPORTANT: the sandbox must live under a path that's mounted into whatever
@@ -157,6 +174,176 @@ def _new_session_branch(name: str, target: Path, kernel: str) -> str:
     return branch
 
 
+# ---------------------------------------------------------------------------
+# Bug 1 fix: pip-editable swap
+# ---------------------------------------------------------------------------
+# On standard AMD perf VMs, the perf container has genesis-world installed
+# pip-editable pointing at the user's main /work/Genesis. PYTHONPATH overrides
+# DO NOT beat editable installs (Python's site-packages comes first via .pth
+# files). So the bench silently runs the user's main checkout while the agent
+# happily edits the sandbox. Detect + swap on setup; restore on teardown.
+
+_PIP_PACKAGE = "genesis-world"  # what's installed via pip
+_SESSION_STATE_FILE = "session_state.json"  # in sandbox dir
+
+
+def _container_name() -> str | None:
+    """The perf container the bench runs in. None if not configured (e.g.
+    non-Genesis project; pip-swap is a no-op then)."""
+    return os.environ.get("AUTOKERNEL_CONTAINER")
+
+
+def _container_path_for(host_path: Path) -> str:
+    """Translate host path -> in-container path under the standard $AUTOKERNEL_ROOT
+    -> /work mount."""
+    rel = host_path.relative_to(_AUTOKERNEL_ROOT)
+    return f"/work/{rel}"
+
+
+def _docker_exec(container: str, *cmd: str, timeout: int = 60) -> tuple[int, str]:
+    """Run command inside container; return (rc, combined_output)."""
+    try:
+        r = subprocess.run(
+            ["docker", "exec", container, *cmd],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+    except FileNotFoundError:
+        return 127, "docker not found"
+
+
+def _detect_pip_editable(container: str, package: str = _PIP_PACKAGE) -> str | None:
+    """Return the editable install location of `package` inside `container`,
+    or None if not editable / not installed."""
+    rc, out = _docker_exec(container, "pip", "show", package, timeout=20)
+    if rc != 0:
+        return None
+    # Look for "Editable project location: /path"
+    for line in out.splitlines():
+        if line.startswith("Editable project location:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _pip_install_editable(container: str, path_in_container: str) -> tuple[int, str]:
+    """`pip install -e PATH --no-deps --no-build-isolation` inside container."""
+    return _docker_exec(
+        container, "pip", "install", "-e", path_in_container,
+        "--no-deps", "--no-build-isolation",
+        timeout=180,
+    )
+
+
+def _do_pip_swap(sandbox_genesis_host: Path) -> dict:
+    """Swap the container's editable genesis-world install to point at the
+    sandbox. Returns a state dict to be persisted for teardown.
+
+    No-op (returns {}) if:
+      - no container configured
+      - genesis-world not installed in the container
+      - genesis-world not editable in the container
+      - editable install already points at the sandbox
+    """
+    container = _container_name()
+    if not container:
+        return {}
+
+    sandbox_in_container = _container_path_for(sandbox_genesis_host)
+    original = _detect_pip_editable(container)
+    if not original:
+        print(f"sandbox: pip-swap SKIP -- {_PIP_PACKAGE} not editable in {container}")
+        return {}
+    if original.rstrip("/") == sandbox_in_container.rstrip("/"):
+        print(f"sandbox: pip-swap SKIP -- {_PIP_PACKAGE} already points at sandbox")
+        return {"container": container, "original": original, "already_swapped": True}
+
+    print(f"sandbox: pip-swap -- {original} -> {sandbox_in_container} (in {container})")
+    rc, out = _pip_install_editable(container, sandbox_in_container)
+    if rc != 0:
+        print(f"sandbox: WARN: pip-swap failed (rc={rc}): {out[-500:]}", file=sys.stderr)
+        print(f"sandbox: WARN: bench will continue using ORIGINAL pip install -- "
+              f"your edits may not take effect!", file=sys.stderr)
+        return {}
+    return {"container": container, "original": original, "swapped_to": sandbox_in_container}
+
+
+def _do_pip_restore(state: dict) -> None:
+    """Restore the editable install to its pre-swap location."""
+    if not state or state.get("already_swapped"):
+        return
+    container = state.get("container")
+    original = state.get("original")
+    if not (container and original):
+        return
+    print(f"sandbox: pip-restore -- restoring {_PIP_PACKAGE} editable to {original}")
+    rc, out = _pip_install_editable(container, original)
+    if rc != 0:
+        print(f"sandbox: WARN: pip-restore failed (rc={rc}): {out[-500:]}", file=sys.stderr)
+        print(f"sandbox: WARN: container's {_PIP_PACKAGE} install may be stuck "
+              f"pointing at the sandbox; manually re-run: "
+              f"docker exec {container} pip install -e {original} --no-deps --no-build-isolation",
+              file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 fix: session state + tamper detection
+# ---------------------------------------------------------------------------
+
+def _session_state_path() -> Path:
+    return _sandbox_dir() / _SESSION_STATE_FILE
+
+
+def _write_session_state(branches: dict[str, str], pip_swap: dict) -> None:
+    """Record session metadata so we can detect tampering later."""
+    state = {
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "started_at": datetime.utcnow().isoformat() + "Z",
+        "host": socket.gethostname(),
+        "user": os.environ.get("USER", "?"),
+        "container": _container_name(),
+        "branches": branches,    # {repo_name: expected_branch}
+        "pip_swap": pip_swap,    # state for restore (or {})
+    }
+    p = _session_state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def _read_session_state() -> dict | None:
+    p = _session_state_path()
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _verify_session_intact() -> tuple[bool, str]:
+    """Check that each cloned repo is still on its expected session branch.
+    Returns (ok, reason). reason is empty if ok."""
+    state = _read_session_state()
+    if not state:
+        return False, "no session_state.json (sandbox may have been wiped)"
+    sandbox = _sandbox_dir()
+    for name, expected in (state.get("branches") or {}).items():
+        repo = sandbox / name
+        if not (repo / ".git").exists():
+            return False, f"{name} repo missing or .git removed (was at {repo})"
+        rc, current = _run(["git", "-C", str(repo), "branch", "--show-current"], check=False)
+        if rc != 0:
+            return False, f"{name}: git branch --show-current failed"
+        current = current.strip()
+        if current != expected:
+            return False, (f"{name}: on branch '{current}' but expected '{expected}'  "
+                           f"(another process may have run git checkout in your sandbox -- "
+                           f"check `git -C {repo} reflog`)")
+    return True, ""
+
+
 def _link_sibling_assets() -> None:
     """Create RELATIVE symlinks for sibling assets so they resolve in BOTH
     host and container contexts (provided both share the mount geometry).
@@ -201,13 +388,15 @@ def cmd_setup(args: argparse.Namespace) -> int:
     print()
 
     paths: dict[str, Path] = {}
+    branches: dict[str, str] = {}
     for name in REPOS:
         target = _ensure_clone(name)
         if target is None:
             continue
         _refresh(name, target)
-        _new_session_branch(name, target, args.kernel)
+        branch = _new_session_branch(name, target, args.kernel)
         paths[name] = target
+        branches[name] = branch
 
     # Sibling assets (newton-assets, etc.) need to be reachable from inside the
     # cloned repos so Genesis-style imports work. Use relative symlinks so they
@@ -215,13 +404,58 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if paths:
         _link_sibling_assets()
 
+    # Bug 1 fix: swap the container's pip-editable Genesis to point at the
+    # sandbox so the bench actually runs the agent's edits.
+    pip_swap = {}
+    if "Genesis" in paths:
+        pip_swap = _do_pip_swap(paths["Genesis"])
+
+    # Bug 3 fix: persist session state so we can detect mid-session tampering.
+    _write_session_state(branches, pip_swap)
+
     print()
     print("=" * 60)
     print("sandbox ready. Source paths the agent should grep:")
     for name, p in paths.items():
-        print(f"  {name:12s} {p}")
+        print(f"  {name:12s} {p}  (branch: {branches[name]})")
+    print("=" * 60)
+    if pip_swap.get("original"):
+        print(f"NOTE pip-swap active. Run `uv run sandbox.py teardown` at end of session "
+              f"to restore the container's editable install.")
     print("=" * 60)
     return 0
+
+
+def cmd_teardown(args: argparse.Namespace) -> int:
+    """Restore the container's pip-editable install + clear session state.
+    Idempotent: safe to call multiple times or when no session is active.
+    Does NOT delete the sandbox dirs (use `wipe --yes` for that)."""
+    state = _read_session_state()
+    if not state:
+        print("sandbox: teardown -- no active session (nothing to restore)")
+        return 0
+    pip_swap = state.get("pip_swap") or {}
+    _do_pip_restore(pip_swap)
+    _session_state_path().unlink(missing_ok=True)
+    print("sandbox: teardown complete; session state cleared")
+    return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Check that the sandbox is still on its expected branches. Exits 2 on
+    tamper (so callers can `set -e` style propagate the failure)."""
+    ok, reason = _verify_session_intact()
+    if ok:
+        state = _read_session_state() or {}
+        for name, branch in (state.get("branches") or {}).items():
+            print(f"sandbox: {name} -- on {branch} OK")
+        return 0
+    print(f"sandbox: TAMPER DETECTED -- {reason}", file=sys.stderr)
+    print(f"sandbox: hint: another agent may have run git operations in this sandbox.",
+          file=sys.stderr)
+    print(f"sandbox: hint: try `git -C $REPO reflog` to recover; then re-run setup.",
+          file=sys.stderr)
+    sys.exit(2)
 
 
 def cmd_path(args: argparse.Namespace) -> int:
@@ -283,8 +517,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("setup", help="clone + refresh + create session branch")
+    s = sub.add_parser("setup", help="clone + refresh + create session branch + pip-swap")
     s.add_argument("--kernel", required=True, help="kernel name (used to name the session branch)")
+
+    sub.add_parser("teardown",
+                   help="restore container's pip-editable install + clear session state")
+    sub.add_parser("verify",
+                   help="check sandbox hasn't been tampered with (exits 2 on tamper)")
 
     p = sub.add_parser("path", help="print sandbox path for a repo")
     p.add_argument("--repo", required=True, choices=list(REPOS.keys()))
@@ -297,11 +536,13 @@ def main() -> int:
 
     args = ap.parse_args()
     return {
-        "setup":   cmd_setup,
-        "path":    cmd_path,
-        "refresh": cmd_refresh,
-        "status":  cmd_status,
-        "wipe":    cmd_wipe,
+        "setup":    cmd_setup,
+        "teardown": cmd_teardown,
+        "verify":   cmd_verify,
+        "path":     cmd_path,
+        "refresh":  cmd_refresh,
+        "status":   cmd_status,
+        "wipe":     cmd_wipe,
     }[args.cmd](args)
 
 

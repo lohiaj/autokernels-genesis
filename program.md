@@ -12,7 +12,7 @@ You are running on an AMD VM with ROCm 6.x, `rocm-smi`, `rocprofv3`, and (probab
 
 ## Phase A — Reconnaissance (~10 min, with the human)
 
-### A0. Set up the sandbox (auto-clone Genesis + Quadrants)
+### A0. Set up the sandbox (auto-clone Genesis + Quadrants + pip-swap)
 
 This is non-negotiable. Do not edit anywhere outside the sandbox.
 
@@ -21,11 +21,22 @@ uv run sandbox.py setup --kernel "$KERNEL_NAME"
 ```
 
 This:
-- Clones **Genesis** from `https://github.com/ROCm/Genesis.git` into `~/.cache/autokernels-genesis/sandbox/Genesis` (or refreshes if it exists) and checks out the AMD-perf release branch (default `release/0.4.4.amdperf`; override via `AUTOKERNEL_GENESIS_BRANCH`).
-- Clones **Quadrants** from `https://github.com/ROCm/quadrants.git` into `~/.cache/autokernels-genesis/sandbox/Quadrants` and checks out `amd-integration` (override via `AUTOKERNEL_QUADRANTS_BRANCH`).
-- Creates a fresh per-session branch `autokernel/<kernel>-<timestamp>` in each cloned repo. All your edits go on this branch. Reverts (`git reset --hard HEAD~1`) only walk back commits you made on this session branch.
+- Clones **Genesis** from `https://github.com/ROCm/Genesis.git` into `~/work/.cache/autokernels-genesis-sandbox/Genesis` (or refreshes if it exists) and checks out the AMD-perf release branch (default `release/0.4.4.amdperf`; override via `AUTOKERNEL_GENESIS_BRANCH`).
+- Clones **Quadrants** from `https://github.com/ROCm/quadrants.git` and checks out `amd-integration` (override via `AUTOKERNEL_QUADRANTS_BRANCH`).
+- Symlinks `Genesis/newton-assets` to the host's existing copy via a relative symlink that resolves in both host and container.
+- Creates a fresh per-session branch `autokernel/<kernel>-<timestamp>` in each cloned repo. All your edits go on this branch.
+- **(critical)** If `$AUTOKERNEL_CONTAINER` is set and the container has `genesis-world` installed pip-editable, swaps the editable install to point at the sandbox. Without this, the bench would silently run the user's main `/work/Genesis` while you edit the sandbox -- your changes wouldn't take effect. The setup output will print `sandbox: pip-swap -- ...` if a swap happened.
+- Records `session_state.json` under the sandbox so `bench.py` can detect mid-session tampering by other agents on the same VM (multi-tenant safety).
 
-Both URLs and branches are configurable via env vars (`AUTOKERNEL_GENESIS_URL`, `AUTOKERNEL_GENESIS_BRANCH`, `AUTOKERNEL_QUADRANTS_URL`, `AUTOKERNEL_QUADRANTS_BRANCH`) if you need to point at a fork or a newer release branch.
+After setup, before each bench, the harness automatically runs `sandbox.py verify` to check the session is intact. If another agent's `git checkout` lands in your sandbox, the verify halts with a clear error.
+
+**At the end of the session** (after SIGINT, after HALT, or whenever you're done):
+
+```bash
+uv run sandbox.py teardown
+```
+
+This restores the container's pip-editable install to its original location. **You must run this** or the container's `genesis-world` will stay pointed at your sandbox after the agent exits. If you forget, run it later and it's still safe (idempotent).
 
 Capture the sandbox paths the script prints — you'll grep them in A1, edit them in B1.
 
