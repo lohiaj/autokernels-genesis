@@ -30,40 +30,12 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from _classify import classify
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE = SCRIPT_DIR / "workspace"
 KERNELS = SCRIPT_DIR / "kernels"
 RESULTS_TSV = SCRIPT_DIR / "results.tsv"
-
-
-# ---------------------------------------------------------------------------
-# Hypothesis classification (heuristic bag-of-keywords)
-# ---------------------------------------------------------------------------
-
-CLASS_PATTERNS = [
-    ("block_dim",   re.compile(r"\bblock[_-]?dim\b|\bbd\s*=\s*\d|\bblock\s*size\b", re.I)),
-    ("fuse",        re.compile(r"\bfus(e|ed|ing)\b|\bmerge\s+(loops?|kernels?)\b", re.I)),
-    ("hoist",       re.compile(r"\bhoist(ed|ing)?\b|\bcommon\s+sub|\binvariant\b", re.I)),
-    ("inline",      re.compile(r"\binlin(e|ed|ing)\b", re.I)),
-    ("atomic",      re.compile(r"\batomic", re.I)),
-    ("swap",        re.compile(r"\bswap\b|\breorder\b", re.I)),
-    ("simplify",    re.compile(r"\bsimplif|\bdelete|\bdedup|\bremove\s+(redundant|unused)|\bO\(1\)", re.I)),
-    ("async",       re.compile(r"\basync\b|\bglobal[_-]?load[_-]?lds\b|\boverlap\b", re.I)),
-    ("prefetch",    re.compile(r"\bprefetch", re.I)),
-    ("layout",      re.compile(r"\b(soa|aos)\b|\blayout\b|\bvec3\b|\bbitfield\b|\bpack\b", re.I)),
-    ("scheduling",  re.compile(r"\boccupancy\b|\bwave(s|fronts?)?\b|\bxcd\b|\bpersistent\b|\bstream[_-]?k\b", re.I)),
-    ("memory",      re.compile(r"\blds\b|\bbank\s+conflict\b|\bvgpr\b|\bagpr\b|\bregister\b|\bspill\b", re.I)),
-    ("algorithm",   re.compile(r"\balgorithm\b|\bdecomp(ose|osition)?\b|\brefactor\b|\bstructur", re.I)),
-]
-
-
-def classify(description: str) -> str:
-    if not description:
-        return "unknown"
-    for name, rx in CLASS_PATTERNS:
-        if rx.search(description):
-            return name
-    return "other"
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +135,7 @@ def render_recent_reverts(rows: list[dict], n: int = 5) -> str:
     lines = []
     for r in reverts:
         exp = r.get("experiment", "?")
-        cls = classify(r.get("description", ""))
+        cls = classify(r.get("description", ""), r.get("campaign"))
         desc = (r.get("description") or "").replace("\n", " ")[:140]
         lines.append(f"- exp{exp} [{cls}]: {desc}")
     return "\n".join(lines)
@@ -194,7 +166,7 @@ def summarize_campaign(campaign: str, all_rows: list[dict]) -> str:
         oc = outcome(r)
         if oc == "baseline":
             continue
-        cls = classify(r.get("description", ""))
+        cls = classify(r.get("description", ""), campaign)
         f = edited_file(r, manifest_files)
         class_stats[cls]["attempts"] += 1
         file_stats[f]["attempts"] += 1

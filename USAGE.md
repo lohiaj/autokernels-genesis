@@ -196,10 +196,27 @@ What's still per-project after editing `harness.toml`:
 - `references/{project_context.md,mi300x_notes.md}` — the reference docs the agent reads at setup. Replace with your project's context + your GPU's hardware notes.
 - `program.md` — the operating manual. Most of it is generic (loop structure, KEEP rule, never-stop semantics); the campaign list at the top and a few project name mentions need updating.
 
-What's NOT yet abstracted (Layer 2+ work, not yet shipped):
+### Per-campaign hypothesis classes
 
-- Per-campaign hypothesis classification regex (currently hardcoded in `summarize.py` + `global_log.py` for Genesis DSL idioms — block_dim, fuse, hoist, vec3, AABB, LDS, AGPR, ...).
-- Some Genesis-specific guidance in `program.md` (campaign names, references to `qd.kernel`/`qd.func`, etc.).
+Each campaign has its own `kernels/<campaign>/classes.json` mapping hypothesis descriptions to class names. `summarize.py` and `global_log.py` use this to bucket experiments for the per-class success table. Schema:
+
+```json
+{
+  "comment": "Hypothesis classification for <campaign>. ...",
+  "patterns": [
+    ["<class_name>", "<case-insensitive regex, first match wins>"],
+    ["block_dim",   "\\bblock[_-]?dim\\b|\\bbd\\s*=\\s*\\d"],
+    ["fuse",        "\\bfus(e|ed|ing)\\b|\\bmerge\\s+(loops?|kernels?)\\b"],
+    ["aabb",        "\\baabb\\b|\\baxis[_-]?aligned\\b"]
+  ]
+}
+```
+
+If a campaign has no `classes.json`, the harness falls back to a built-in generic GPU-kernel-tuning vocabulary (block_dim, fuse, hoist, layout, async, atomic, ...) defined in `_classify.py::DEFAULT_PATTERNS`. The fallback is reasonable for any GPU project; per-campaign overrides give domain-specific signal (e.g. `aabb` and `intersect` for broad-phase, `mass_matrix` and `cartesian` for the step kernels, `constraint` and `cg_solver` for the body monolith).
+
+What's NOT yet abstracted (Layer 3 work):
+
+- Some Genesis-specific guidance in `program.md` (campaign names, references to `qd.kernel`/`qd.func`, the worked example uses Genesis paths). Roughly half-day to template out.
 
 ## Files the agent must NEVER modify
 

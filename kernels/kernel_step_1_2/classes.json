@@ -1,0 +1,19 @@
+{
+  "comment": "Hypothesis classification for kernel_step_1_2 family (Step1/Step2 generated subkernels: cartesian update, mass assemble, factor_mass siblings, qfrc/gauss/cost loops). Plus standard GPU-kernel-tuning vocabulary.",
+  "patterns": [
+    ["block_dim",     "\\bblock[_-]?dim\\b|\\bbd\\s*=\\s*\\d|\\bblock\\s*size\\b"],
+    ["fuse",          "\\bfus(e|ed|ing)\\b|\\bmerge\\s+(loops?|kernels?)\\b"],
+    ["hoist",         "\\bhoist(ed|ing)?\\b|\\bcommon\\s+sub|\\binvariant\\b"],
+    ["inline",        "\\binlin(e|ed|ing)\\b"],
+    ["mass_matrix",   "\\bmass[_-]?(mat|matrix)\\b|\\bfactor[_-]?mass\\b|\\bmass[_-]?assemble"],
+    ["cartesian",     "\\bcartesian\\b|\\bworld[_-]?space\\b|\\bcom\\b"],
+    ["qfrc",          "\\bqfrc\\b|\\bqacc\\b|\\bqgrad\\b|\\bgauss\\b|\\bcost\\b"],
+    ["atomic",        "\\batomic"],
+    ["simplify",      "\\bsimplif|\\bdelete|\\bdedup|\\bremove\\s+(redundant|unused)|\\bO\\(1\\)"],
+    ["async",         "\\basync\\b|\\bglobal[_-]?load[_-]?lds\\b|\\boverlap\\b|\\bprefetch"],
+    ["layout",        "\\b(soa|aos)\\b|\\blayout\\b|\\bvec3\\b|\\bbitfield\\b|\\bpack\\b"],
+    ["scheduling",    "\\boccupancy\\b|\\bwave(s|fronts?)?\\b|\\bxcd\\b|\\bpersistent\\b|\\bstream[_-]?k\\b"],
+    ["memory",        "\\blds\\b|\\bbank\\s+conflict\\b|\\bvgpr\\b|\\bagpr\\b|\\bregister\\b|\\bspill\\b"],
+    ["algorithm",     "\\balgorithm\\b|\\bdecomp(ose|osition)?\\b|\\brefactor\\b|\\bstructur"]
+  ]
+}

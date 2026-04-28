@@ -13,6 +13,7 @@ A coding agent (Claude Code, Codex) reads `program.md`, picks a kernel campaign,
 - **Per-class success memory.** `summarize.py` distills `results.tsv` into `workspace/learning.md` so the next iteration sees what's worked and what hasn't.
 - **Cross-agent statistical drift HALT.** Watchdog detects infrastructure drift by monitoring KEEP-throughput trends across all GPUs.
 - **Single-file config.** Every project- and platform-specific value (reference baseline, container image, bench script, profiler command, GPU clock-pin command, cache wipe paths) is in [`harness.toml`](harness.toml). Edit one file to retarget the harness at a different ROCm project or GPU.
+- **Per-campaign hypothesis vocabulary.** Each campaign has its own `kernels/<campaign>/classes.json` defining the regex patterns that bucket descriptions into classes (`block_dim`, `aabb`, `mass_matrix`, etc.). Drives the per-class success table the agent reads each iteration.
 
 ## Architecture
 
@@ -21,6 +22,7 @@ autokernels-genesis/
 ├── program.md                  agent operating manual (the prompt)
 ├── harness.toml                single-file config: reference, bench, container, profiler, GPU
 ├── _config.py                  TOML loader with safe fallbacks
+├── _classify.py                per-campaign hypothesis classification
 ├── prepare.py                  one-time env check + variance calibration
 ├── bench.py                    multi-trial bench + sigma + clock pin + rubric gate
 ├── correctness.py              scoped pytest subset per campaign
