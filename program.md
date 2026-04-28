@@ -166,22 +166,41 @@ You are autonomous from here. You loop until SIGINT. There is no plateau exit, n
 
 ```
 LOOP FOREVER:
-  1. read state:    cat results.tsv | tail -20    # what you've tried recently
-                    cat learning.md 2>/dev/null   # your distilled notes (you maintain this)
+  1. read state:    cat results.tsv | tail -20
+                    cat learning.md 2>/dev/null
   2. think:         form ONE focused hypothesis using B1.5 below
   3. edit:          modify the kernel source file (and only that file)
-  4. commit:        git add -A && git commit -m "exp <N>: <hypothesis>"
-                                                  (rubric in body, see B1.5)
+  4. commit:        git add -A && git commit -m "exp <N>: <hypothesis>"  (rubric in body)
   5. correctness:   <correctness command>
-                    if FAIL -> git reset --hard HEAD~1, log as 'discard',
-                              record reason, goto 1
-  6. bench:         <bench command> 2>&1 | tee run.log
-                    extract metric
-  7. decide:        B2 KEEP rule below; KEEP or git reset --hard HEAD~1
-  8. record:        append a row to results.tsv
-                    update learning.md with the lesson learned
+                    if FAIL -> git reset --hard HEAD~1, log as 'discard', goto 1
+  6. A/B BENCH:     uv run ab.py ab \
+                       --base HEAD~1 --cand HEAD \
+                       --target-kernel '<your kernel name regex>' \
+                       --trials 5 \
+                       --name "exp<N>"
+                    (NEVER use bench.py directly for KEEP/DISCARD decisions --
+                     ab.py is the only sanctioned decision interface; see B2.)
+  7. decide:        cat workspace/ab/<latest>/decision.json | jq '.verdict'
+                    KEEP if verdict == "KEEP"
+                    REVERT (git reset --hard HEAD~1) if verdict in
+                      {"DISCARD", "KERNEL_OK_E2E_FLAT", "CROSS_KERNEL_REGRESSION"}
+                    NOISY_REDO -> wait for GPU contention to clear, re-run step 6
+  8. record:        append a row to results.tsv with verdict + the 1-line reason
+                    update learning.md with the lesson and the writeup path
   9. goto 1
 ```
+
+**You MUST NOT make a KEEP/DISCARD decision from a single `bench.py` run.** That methodology produced a -33.1% kernel claim that re-measured at -0.31% on the production stack. The only sanctioned decision interface is `ab.py`, which:
+
+- Verifies the toggle by hashing changed files on each arm (catches silent toggle failures).
+- Runs N≥5 paired interleaved trials so thermal/contention drift hits both arms equally.
+- Wipes caches once per session and warms up each arm before the first measured trial.
+- Requires median Δ ≥ +0.5%, sign consistency ≥ ⌈N×0.6⌉, mean+median same sign, base CoV ≤ 3%, AND the Amdahl plausibility check on E2E vs kernel% × kernel-Δ.
+- Runs rocprof paired (M≥2 per arm) and dumps the top-8 kernel deltas; if any non-target kernel got slower by ≥ 2%, returns CROSS_KERNEL_REGRESSION.
+- Aborts with CONCURRENT_LOAD_DETECTED if GPU contention exceeds 5% for 5 minutes (the c-series autoresearch loop on the same box will trigger this).
+- Writes a per-trial JSON footer with branch/commit/hashes/RigidOptions/HW so every result is independently reproducible.
+
+See `ab.py --help` for tuning knobs.
 
 ### B1.5. The three-question forcing function
 
@@ -204,22 +223,23 @@ omniperf analyze -p workloads/exp/<gpu_arch>
 
 Then cite the dominant bottleneck (LDS bank conflicts, VGPR spill, occupancy, HBM BW, etc.) in line 1 of the commit body. **This is the single most important behavioral rule.** Skipping the rubric produces "checklist mode" — the agent grinds through obvious tweaks, plateaus, and stalls.
 
-### B2. Decision rules (disjunctive 2σ KEEP)
+### B2. Decision rules (delegated to ab.py)
 
-Hard reverts (apply first, in order):
+The KEEP/DISCARD/CROSS_KERNEL_REGRESSION/KERNEL_OK_E2E_FLAT/NOISY_REDO decision is **made by `ab.py`**, not by you reading numbers off a single `bench.py` run. Follow whatever verdict `ab.py` emits in `workspace/ab/<latest>/decision.json::verdict`. The full decision rule (all of these must hold for KEEP):
 
-1. **Correctness FAIL** → REVERT. `git reset --hard HEAD~1`. Never keep an incorrect kernel.
-2. **Crash / timeout** → if trivial (typo, import), fix and amend. Three crashes on the same hypothesis → abandon it.
-3. **OOM / VRAM blow-up** → REVERT.
+1. Correctness PASS on both arms.
+2. Median paired Δ ≥ +0.5% on the headline metric (E2E throughput).
+3. Sign consistency: ≥ ⌈N × 0.6⌉ of N trials are positive.
+4. Mean and median paired Δ have the same sign (sanity guard against single huge outliers).
+5. Base CoV ≤ 3% on the headline metric (otherwise NOISY_REDO; wait for GPU contention to clear).
+6. Amdahl plausibility: if you claim a Y% kernel improvement on a kernel that's X% of frame time, observed E2E gain must be ≥ 0.3 × (X% × Y%). Otherwise KERNEL_OK_E2E_FLAT.
+7. No non-target top-8 kernel got slower by ≥ 2%. Otherwise CROSS_KERNEL_REGRESSION.
 
-Then KEEP if **any one** of the following holds (correctness PASS assumed):
+Hard reverts before A/B even runs:
+- **Correctness FAIL** on the candidate → REVERT, log as discard. Never keep an incorrect kernel.
+- **Crash / timeout / OOM** → if trivial fix (typo, import), amend; three crashes on the same hypothesis → abandon.
 
-- **Metric improved by ≥ 2σ** of the baseline noise. If you have multi-trial measurements, σ is the stdev across trials. If single-trial, conservatively use σ = 1% × value (or whatever your A5 noise estimate said).
-- **Simplicity tiebreaker:** metric within ±2σ AND `git diff HEAD~1 --shortstat` shows net deletion of ≥5 lines. Simpler code wins on ties — that's a kept simplification.
-
-Otherwise: REVERT.
-
-For benches under ~2 min, run 3 trials per experiment and use the trial-stdev for σ. For benches over ~5 min, use 1 trial; if the result looks marginal (within 2-3% of baseline), re-run with 3 trials before deciding.
+Simplicity tiebreaker (`KEEP` even at flat metric): handled by ab.py via the simplification path — net deletion ≥ 5 lines AND median Δ within ±2 × base CoV.
 
 ### B3. Single-change discipline
 
@@ -333,6 +353,51 @@ You read this at the top of every loop iteration. You append after every experim
 6. **Tag every kept commit with the experiment number** (`exp 14: ...`). The git log is your audit trail.
 7. **Do not commit `results.tsv`, `run.log`, `correctness.log`, or `learning.md`.** They're per-session artifacts; gitignored at the autokernels-genesis repo root, not the sandbox.
 8. **NEVER STOP.** Only SIGINT exits.
+9. **All KEEP/DISCARD decisions go through `ab.py`.** No exceptions. See "Forbidden patterns" below.
+
+## Forbidden patterns (zero tolerance)
+
+These were the methodological roots of past KEEP claims that didn't reproduce. The harness is designed to catch and refuse them; do not work around it.
+
+- ❌ "Bench A once, bench B once, compare ad-hoc %" — single-trial decisions of any kind, on any metric.
+- ❌ KEEP based on kernel-time alone. Kernel faster + E2E flat = `KERNEL_OK_E2E_FLAT` = DISCARD with that label, not KEEP.
+- ❌ Cache wipe between arms without symmetric warmup runs (asymmetric JIT cost).
+- ❌ Reporting % change without sign consistency, base CoV, AND paired delta.
+- ❌ "Within noise floor" without computing the actual noise floor for THIS session.
+- ❌ Comparing across builds with different Quadrants commits without rebenching the baseline.
+- ❌ Implicit baseline. Every result must explicitly name the base commit it was measured against (`ab.py` does this for you).
+- ❌ Using your own `prior(working): 0.65` as evidence to KEEP. Priors are fine for picking what to try; only paired E2E + rocprof + cross-kernel confirms KEEP.
+
+## Per-experiment writeup format (in `learning.md`)
+
+For every experiment, append a block of this exact shape (copy from `workspace/ab/<latest>/summary.md` which `ab.py` generates for you):
+
+```
+exp K [name] STATUS
+- branch:        perf/.../exp-K
+- base_commit:   <sha>
+- cand_commit:   <sha>
+- files:         [...]
+- correctness:   PASS|FAIL|N/A (q/v stats Δ, contact count Δ)
+- rocprofv3 (median of M ≥ 2 runs):
+    target_kernel:        base=X.XX  cand=Y.YY  Δ=±Z.ZZ%
+    top non-target:       ...same format... (flag any |Δ| ≥ 2%)
+    total_kernel_time:    base=X.XX  cand=Y.YY  Δ=±Z.ZZ%
+- E2E (N ≥ 5 paired interleaved trials):
+    per-trial paired Δ:   [...]
+    paired median Δ:      ±Z.ZZ%
+    paired mean   Δ:      ±Z.ZZ%
+    sign consistency:     K/N positive
+    base CoV:             X.XX%
+    noise_suspect trials: [...]
+- Amdahl prediction vs observed:
+    target kernel was X% of frame; claimed kernel Δ Y%
+    expected E2E Δ ≈ X% × Y% = Z%
+    observed E2E Δ = W%
+    ratio observed/expected = W/Z
+- decision: KEEP | DISCARD | KERNEL_OK_E2E_FLAT | CROSS_KERNEL_REGRESSION | NOISY_REDO
+- 1-line reason
+```
 
 ---
 
