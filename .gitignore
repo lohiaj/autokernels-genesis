@@ -21,6 +21,10 @@ results.tsv
 run.log
 verify.log
 omniperf.log
+correctness.log
+learning.md
+ideas.md
+compiler_proposals.md
 *.log
 
 # Caches

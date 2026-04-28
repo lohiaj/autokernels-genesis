@@ -1,6 +1,22 @@
-# Usage
+# Usage — Advanced (8-GPU multi-campaign mode)
 
-End-to-end guide for running an overnight autokernels-genesis session on 8× MI300X. Read the [README](README.md) first for the conceptual overview, and the [`program.md`](program.md) operating manual the agent itself reads.
+> **For single-kernel optimization on a normal AMD VM, you don't need this guide.**
+> The 4-step quickstart in [README.md](README.md) is the whole product:
+> `git clone` → `cd` → start the agent → tell it the kernel name. The agent
+> reads `program.md` and does the rest.
+>
+> This guide is for the original Genesis-on-MI300X integration: 8 agents
+> running in parallel across 8 MI300X, each working a different "campaign"
+> (group of kernels), sharing a cross-agent loss log, with a watchdog daemon
+> for indefinite-run safety. Skip this unless you specifically need that.
+
+End-to-end guide for running an overnight autokernels-genesis session on 8× MI300X with the campaign-driven harness. Read the [README](README.md) first for the conceptual overview, and the [`program-advanced.md`](program-advanced.md) operating manual the agent itself reads in this mode (note: NOT `program.md`, which is the simple single-kernel flow).
+
+When you start an agent for advanced mode, the prompt is:
+
+```
+my campaign is YOUR_CAMPAIGN. read program-advanced.md and start optimizing.
+```
 
 ## Prerequisites
 

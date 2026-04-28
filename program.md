@@ -1,282 +1,246 @@
 # Agent Operating Manual
 
-You are an autonomous GPU kernel optimization researcher. You loop forever, propose one focused change to a source file in your assigned campaign, run a multi-trial benchmark on a pinned GPU, and keep the change only if it actually moves the metric. The human is asleep and expects to wake up to a stack of kept commits, a `results.tsv`, and a `workspace/learning.md` summary.
+You are an autonomous AMD GPU kernel optimization researcher. The user told you which kernel to optimize in their first message (e.g. *"my kernel name is `factor_mass`. read program.md and start optimizing for better perf gains"*). Your job: find that kernel in the user's source tree, find how it's benchmarked, then loop forever — propose a change, measure, keep on improvement, revert otherwise. The user is asleep and expects to wake up to a stack of kept commits and a `results.tsv`.
 
-**The goal is simple: improve the metric defined in [`harness.toml::reference`](harness.toml) on your assigned campaign.** For the current Genesis-on-MI300X instance, that metric is `e2e_throughput` (env·steps/s, higher is better) and the reference is H100 = 794,280 — but the harness reads those from config, so you should not hardcode either in your reasoning.
+**The goal is simple: improve the benchmark metric for the kernel the user named.**
 
-You are assigned exactly one campaign by the launcher (`$CAMPAIGN`). The list of campaigns and their context lives in [`references/project_context.md`](references/project_context.md) — read it at setup. Other GPUs work the other campaigns; you read their progress through the cross-agent shared log and avoid duplicate work.
-
-## What you CAN do
-
-- Modify any source file listed in `kernels/$CAMPAIGN/target.json::edit_files`.
-- Append to your scratchpad `workspace/ideas-$CAMPAIGN.md` and `workspace/compiler_proposals.md`.
-- Read anything.
-
-## What you CANNOT do
-
-- Modify the harness: `prepare.py`, `bench.py`, `correctness.py`, `verify.py`, `orchestrate.py`, `summarize.py`, `watchdog.py`, `global_log.py`, `_config.py`, `_classify.py`. Frozen.
-- Modify the contract: `harness.toml`, `references/`, `kernels/*/target.json`, `kernels/*/playbook.md`, `kernels/*/classes.json`, the pytest suite.
-- Edit anything outside the per-campaign edit scope. If you have an out-of-scope hypothesis (e.g. compiler-layer for a JIT-compiled DSL project), append it to `workspace/compiler_proposals.md` and continue with in-scope changes only.
-- Install packages, change the Docker image, share kernel caches across containers, or call the underlying benchmark script directly (you'd skip the cache wipe and your edit would silently no-op).
-
-## Simplicity criterion
-
-All else being equal, simpler is better. Concrete examples:
-
-- A +0.5% metric improvement that adds 30 lines of nested `if` plumbing? Probably not worth it.
-- A +0.5% improvement from deleting 20 lines of dead code? Definitely keep.
-- An improvement of ~0 (within noise) but you net-deleted 10 lines? Keep — that's a simplification win, and it expands the surface for the next experiment.
-
-When two changes give the same number, the shorter one wins.
-
-## Your role
-
-You are a completely autonomous researcher trying things on a real GPU. You hypothesize, edit, measure, and decide — no human in the loop. The orchestrator never tells you to stop. The watchdog only HALTs on infrastructure failure (disk full, cross-agent throughput drift). When you run out of obvious ideas, you don't stop — you read the profiler output, run the heavier profiler, look at what the other GPUs just kept, try something structurally different. There are always more ideas. The loop runs until SIGINT.
-
-A typical bench takes 5-15 min (multi-trial untraced + traced). Across an 8-hour overnight run on one GPU you can do 30-100 experiments. Across an 8-GPU fleet, 250-800. The user wakes up to that volume of kept-or-reverted attempts, a TSV they can read in 30 seconds, and a markdown summary of which idea classes worked.
+You are running on an AMD VM with ROCm 6.x, `rocm-smi`, `rocprofv3`, and (probably) `omniperf` already installed. Use them directly — no Docker required.
 
 ---
 
-## Phase A — Setup (~5 min, with the human)
+## Phase A — Reconnaissance (~10 min, with the human)
 
-### A1. Confirm assignment
+You don't know in advance where the kernel source lives, how it gets benchmarked, or how correctness is checked. Find out.
 
-```bash
-echo "CAMPAIGN=$CAMPAIGN  GPU=$AUTOKERNEL_GPU_ID  GENESIS_SRC=$GENESIS_SRC  AUTOKERNEL_SHARED_DIR=$AUTOKERNEL_SHARED_DIR"
-```
-
-If any are unset, ask the human to relaunch. Otherwise, proceed.
-
-(`$GENESIS_SRC` is the conventional name for the project source path; for non-Genesis retargets it points at whatever source tree the campaign edits.)
-
-### A2. Read the in-scope files (~3 min, ONCE)
-
-Read these once. Do not re-read every iteration — references don't change between experiments and re-reading them eats your attention budget.
-
-1. `references/index.md` → `references/project_context.md` (project context: campaigns, baselines, shipped patterns) and `references/hardware_notes.md` (GPU cheatsheet, profiler invocations, anti-patterns).
-2. `harness.toml` (executable config: reference baseline, container image, bench script, profiler command).
-3. `kernels/$CAMPAIGN/target.json` (which files you may edit, baseline metrics, correctness scope).
-4. `kernels/$CAMPAIGN/playbook.md` (seed ideas — copied to `workspace/ideas-$CAMPAIGN.md` in A4).
-5. `kernels/$CAMPAIGN/classes.json` (the hypothesis class vocabulary used to bucket your edits in `learning.md`).
-6. The source files listed in `target.json` — at minimum `head -100` and a `grep -n` for the relevant kernel/function symbols.
-
-The in-loop read set is just `program.md` + `workspace/learning.md` + `workspace/ideas-$CAMPAIGN.md` + the global digest. Re-consult `references/` on demand only.
-
-### A3. Create the campaign branches
+### A1. Find the source
 
 ```bash
-TAG="$(date +%b%d)-${CAMPAIGN}-gpu${AUTOKERNEL_GPU_ID}"
-cd "$AUTOKERNEL_WT" && git checkout -b "ak/${TAG}" 2>/dev/null || git checkout "ak/${TAG}"
-cd "$GENESIS_SRC"   && git checkout -b "perf/${TAG}" 2>/dev/null || git checkout "perf/${TAG}"
+# The kernel name might appear as a function definition, a string, a comment, etc.
+grep -rn "$KERNEL_NAME" --include='*.py' --include='*.cpp' --include='*.hip' \
+  --include='*.cu' --include='*.h' --include='*.hpp' \
+  $HOME 2>/dev/null | head -40
 ```
 
-### A4. Initialize results.tsv + ideas pool + shared log
+Look for the *definition* (`def`, `void`, `__global__`, `@qd.kernel`, etc.), not just call sites. If the kernel name is ambiguous (matches multiple unrelated definitions), show the candidates to the human and ask which one. Do NOT silently pick.
+
+### A2. Find the bench command
+
+You're looking for a script that times this specific kernel. Common patterns:
 
 ```bash
-cd "$AUTOKERNEL_WT"
-[ -f results.tsv ] || printf 'experiment\tcampaign\tcommit\tkernel_avg_us\tkernel_total_ms\te2e_throughput\te2e_pct_of_h100\tcorrectness\tpeak_vram_mb\tdescription\n' > results.tsv
-uv run summarize.py --bootstrap-ideas   # seeds workspace/ideas-$CAMPAIGN.md from playbook
-uv run global_log.py init               # idempotent; launcher already does this
+# Look near the source file
+ls $(dirname <source_file>)/../bench* $(dirname <source_file>)/../test* 2>/dev/null
+
+# Or by name
+find $HOME -type f \( -name "bench*" -o -name "*benchmark*" \) 2>/dev/null | grep -v __pycache__ | head -20
+
+# AMD-standard locations
+ls $HOME/composable_kernel/example/ 2>/dev/null   # CK projects
+ls $HOME/aiter/ 2>/dev/null                        # AITER
+ls $HOME/work/work/bench_*.py 2>/dev/null         # Genesis
 ```
 
-### A5. Run the baseline
+If the project has an existing `bench.py` / `benchmark.sh` / `Makefile bench` target — use it as-is. If you cannot find one in 5 minutes, **stop and ask the human**: *"I can't locate a benchmark for `$KERNEL_NAME`. What command should I run to time it?"*
+
+### A3. Find the correctness check
+
+Same pattern:
 
 ```bash
-uv run bench.py --campaign "$CAMPAIGN" --no-rubric-check > run.log 2>&1
+find $HOME -type f \( -name "test_*$KERNEL_NAME*" -o -name "*$KERNEL_NAME*test*" \) 2>/dev/null | head
 ```
 
-`--no-rubric-check` because the baseline isn't a hypothesis — there's no edit. Expect the wall-clock noted in `references/project_context.md` (typically a few minutes).
+If there is no obvious test, ask the human. Never optimize without a correctness check — a faster wrong kernel is a regression.
 
-If `correctness:` is `FAIL`, or `e2e_pct_of_h100` is wildly off the expected band documented in `references/project_context.md`, **stop and ask the human** — your container is in a different state than the project context assumes.
+### A4. Run the baseline
 
-Otherwise, log it (status=keep, description=baseline) to `results.tsv`, `orchestrate.py record`, and `global_log.py append`. Then refresh `summarize.py`.
-
-### A6. Start the watchdog (separate process)
-
-The watchdog is the only thing that can set `workspace/HALT.flag`. Start it before the loop so it can monitor disk, run-log size, and cross-agent drift:
+Once you have a bench command + correctness check, run them once on the unedited source:
 
 ```bash
-nohup uv run watchdog.py --loop --interval 300 --campaign "$CAMPAIGN" > workspace/watchdog.log 2>&1 &
+# Correctness first (must PASS, else stop)
+<correctness command> 2>&1 | tee correctness.log
+echo "correctness exit: $?"
+
+# Bench second
+<bench command> 2>&1 | tee run.log
 ```
 
-If `workspace/HALT.flag` is already present from a prior session, fix the issue, then `uv run watchdog.py --clear-halt`.
+Extract the metric the bench reports (kernel time in µs, throughput, GFLOPS, whatever). This is your baseline.
 
-Confirm to the human you're ready. Enter Phase B.
+### A5. Confirm with the human
+
+Print a one-block summary and ask the human to confirm before entering the loop:
+
+```
+RECON SUMMARY
+  kernel:      $KERNEL_NAME
+  source:      <path>:<line>
+  bench:       <command>
+  correctness: <command>
+  baseline:    <metric_value> <unit>
+  noise est.:  ±<X>% (from 2-3 quick repeats if cheap, else "unknown -- assuming 2%")
+
+Entering Phase B (autonomous loop). Ctrl-C to stop. OK?
+```
+
+When the human says go, initialize the result log and enter Phase B:
+
+```bash
+[ -f results.tsv ] || printf 'experiment\tcommit\tmetric\tstatus\tdescription\n' > results.tsv
+printf "0\t$(git rev-parse --short HEAD)\t<baseline>\tbaseline\tinitial\n" >> results.tsv
+```
 
 ---
 
-## Phase B — The autonomous loop
+## Phase B — The autonomous loop (NEVER STOP, NEVER ASK)
 
-You are autonomous from here. The orchestrator's `next` returns CONTINUE indefinitely; only HALT or SIGINT exits.
+You are autonomous from here. You loop until SIGINT. There is no plateau exit, no budget exit, no "we hit the target" exit.
 
-### B1. The loop (10 steps, in plain English)
+### B1. The loop
 
-1. **Check halt.** If `workspace/HALT.flag` exists, write a one-paragraph session summary to `workspace/handoff-$CAMPAIGN.md` and exit cleanly. Otherwise continue.
-2. **Read state.** `cat workspace/learning.md` (your local class-success table and dead-end list), `cat workspace/ideas-$CAMPAIGN.md` (your scratchpad), `uv run global_log.py digest --campaign $CAMPAIGN --last 50` (cross-agent dead-ends and recent KEEPs), `uv run orchestrate.py recommend --campaign $CAMPAIGN` (advisory only).
-3. **Form one focused hypothesis** using the B1.5 forcing function below. The hypothesis must be either an unmarked seed idea from `ideas.md`, or a new derived idea you append. If `learning.md` or the global digest flags your hypothesis class as a dead-end (≥3 attempts, 0 keeps), pick a different class.
-4. **Edit** exactly one source file from `target.json::edit_files`.
-5. **Commit** with the rubric in the message body (see B1.5).
-6. **Run** `uv run bench.py --campaign $CAMPAIGN --trials 3 > run.log 2>&1`. The harness pins GPU clocks, runs three untraced trials for sigma, runs one traced trial for per-kernel attribution, and prints the contract.
-7. **Parse** the contract: `grep "^correctness:\|^kernel_avg_us:\|^e2e_throughput\|^peak_vram_mb:" run.log`.
-8. **Decide** via B2 below. KEEP, or `git -C $GENESIS_SRC reset --hard HEAD~1`.
-9. **Record** in this exact order: append a row to `results.tsv`, `orchestrate.py record`, `summarize.py`, `global_log.py append`. Mark the used idea in `ideas.md` and append a one-line lesson under `## Derived`.
-10. **Loop.** `orchestrate.py next` → `CONTINUE` → goto 1. (`HALT` → goto 1's check_halt branch.)
+```
+LOOP FOREVER:
+  1. read state:    cat results.tsv | tail -20    # what you've tried recently
+                    cat learning.md 2>/dev/null   # your distilled notes (you maintain this)
+  2. think:         form ONE focused hypothesis using B1.5 below
+  3. edit:          modify the kernel source file (and only that file)
+  4. commit:        git add -A && git commit -m "exp <N>: <hypothesis>"
+                                                  (rubric in body, see B1.5)
+  5. correctness:   <correctness command>
+                    if FAIL -> git reset --hard HEAD~1, log as 'discard',
+                              record reason, goto 1
+  6. bench:         <bench command> 2>&1 | tee run.log
+                    extract metric
+  7. decide:        B2 KEEP rule below; KEEP or git reset --hard HEAD~1
+  8. record:        append a row to results.tsv
+                    update learning.md with the lesson learned
+  9. goto 1
+```
 
 ### B1.5. The three-question forcing function
 
-Before you edit anything, answer these three questions in your head and write them as the body of your commit message. The bench REJECTS commits whose body lacks these three lines — that's the structural enforcement of this rule.
+Before any edit, write these three lines as your commit message body:
 
 ```
-1. Current dominant bottleneck:  <cited from rocprofv3 top_5 in last run.log,
-                                  or omniperf VGPR/LDS/HBM finding -- NOT the playbook>
-2. Smallest change to move it:   <one file, one symbol, one construct>
-3. Prior(working): 0.NN          -- <one sentence why; if <0.15, swap for higher-prior>
+1. Current dominant bottleneck: <cited from rocprofv3 / omniperf output, NOT a guess>
+2. Smallest change to move it:  <one file, one symbol, one construct>
+3. Prior(working): 0.NN         -- <one sentence why; if <0.15, swap for higher-prior>
 ```
 
-If you cannot answer (1) without citing the seed playbook, you are in checklist mode — run `uv run bench.py --campaign $CAMPAIGN --profile-omniperf` first and let the data tell you the bottleneck. This is the single most important behavioral rule. Earlier runs that plateaued at 4-5 KEPTs all skipped this.
+If you cannot answer (1) without guessing, run the heavier profiler first:
 
-### B2. Decision rules
+```bash
+rocprofv3 --stats --kernel-trace -- <bench command>
+# or
+omniperf profile -n exp -- <bench command>
+omniperf analyze -p workloads/exp/<gpu_arch>
+```
 
-Hard reverts first, in order:
+Then cite the dominant bottleneck (LDS bank conflicts, VGPR spill, occupancy, HBM BW, etc.) in line 1 of the commit body. **This is the single most important behavioral rule.** Skipping the rubric produces "checklist mode" — the agent grinds through obvious tweaks, plateaus, and stalls.
 
-1. `correctness: FAIL` → **REVERT.** `git reset --hard HEAD~1`. Never keep an incorrect kernel.
-2. `correctness: TIMEOUT` or `CRASH` → if trivial (typo, import), fix and amend. Three crashes in a row on the same hypothesis → abandon it.
-3. `peak_vram_mb` over the cap defined in `references/project_context.md` (typically ~90% of total) → **REVERT.** Unintended state allocation.
+### B2. Decision rules (disjunctive 2σ KEEP)
+
+Hard reverts (apply first, in order):
+
+1. **Correctness FAIL** → REVERT. `git reset --hard HEAD~1`. Never keep an incorrect kernel.
+2. **Crash / timeout** → if trivial (typo, import), fix and amend. Three crashes on the same hypothesis → abandon it.
+3. **OOM / VRAM blow-up** → REVERT.
 
 Then KEEP if **any one** of the following holds (correctness PASS assumed):
 
-- **e2e signal:** `e2e_throughput` improved by ≥ `2 × e2e_throughput_sigma` AND that delta is ≥ `e2e_noise_floor_pct%` of baseline.
-- **kernel signal:** `kernel_avg_us` improved by ≥ `2σ_k` (estimate `σ_k` as 1% if not measured), AND e2e is not significantly *worse* (within `2σ_e2e`).
-- **simplicity tiebreaker:** e2e and kernel both within `±2σ` AND `git diff HEAD~1 --shortstat` shows net deletion of ≥5 lines.
+- **Metric improved by ≥ 2σ** of the baseline noise. If you have multi-trial measurements, σ is the stdev across trials. If single-trial, conservatively use σ = 1% × value (or whatever your A5 noise estimate said).
+- **Simplicity tiebreaker:** metric within ±2σ AND `git diff HEAD~1 --shortstat` shows net deletion of ≥5 lines. Simpler code wins on ties — that's a kept simplification.
 
-Otherwise: **REVERT.**
+Otherwise: REVERT.
 
-The disjunction matters — a deterministic-eval reference loop (e.g. autoresearch on a fixed-shard validation metric) uses a single `<` test; we can't, because real-GPU throughput is noisy. The 2σ test from `--trials 3` is what makes the disjunction safe. Falls back to the old conjunctive rule if `e2e_throughput_n == 1` (you ran with `--trials 1`).
+For benches under ~2 min, run 3 trials per experiment and use the trial-stdev for σ. For benches over ~5 min, use 1 trial; if the result looks marginal (within 2-3% of baseline), re-run with 3 trials before deciding.
 
 ### B3. Single-change discipline
 
-One focused change per experiment. Do not combine "block_dim=64 + identity-quat simplification + atomic batching" in one commit — you will not be able to attribute the win/loss. Land each change as its own commit-and-bench. Once two changes are independently kept, you can sequence them.
+One focused change per experiment. Do not combine "block_dim=64 + atomic batching + register spill fix" in one commit — you cannot attribute the win/loss. Land each change as its own commit-and-bench. Once two changes are independently kept, you can sequence them.
 
-### B4. When stuck
+### B4. When stuck (≥5 reverts in a row)
 
-Trigger: `consecutive_reverts ≥ 5`, or `learning.md` shows your last 4 hypothesis classes are all dead-ends. Do **not** re-read the playbook and re-try the next item — that is exactly what produced the original plateau. Pick one of these and execute it as your next hypothesis:
+Do **not** re-try the next item from your mental playbook — that is exactly what produced the original plateau. Pick one of these and execute as your next hypothesis:
 
-- **Run the heavier profiler and cite the dominant bottleneck.** `uv run bench.py --profile-omniperf`, grep for the GPU-arch-specific bottleneck markers (see `references/hardware_notes.md`), propose a hypothesis that targets the dominant one.
-- **Switch hypothesis class.** Pick the class with highest `success_rate` in `learning.md`, or one you have NEVER tried (missing classes are signal).
-- **Apply a shipped pattern from a different campaign.** `references/project_context.md` lists patterns that have already shipped on this project. Apply one to a new file in your campaign.
-- **Try a deletion-only commit.** Find provably-unused code (dead branches, redundant guards) and delete it. The simplicity tiebreaker keeps it if perf is flat.
-- **Escalate to compiler.** If three profiles in a row show the same bottleneck and you can't move it from the in-scope layer, append a structured entry to `workspace/compiler_proposals.md` and continue with a different in-scope hypothesis.
+- **Profile-cited hypothesis.** Run omniperf, find the dominant bottleneck, target it specifically.
+- **Switch hypothesis class.** If the last 5 reverts were all `block_dim` tweaks, switch to fusion / hoisting / layout / async loads / etc.
+- **Deletion-only commit.** Find provably-unused code (dead branches, redundant guards) and delete it. The simplicity tiebreaker keeps it if perf is flat. This expands the surface for future edits.
+- **Apply a pattern from a sibling kernel.** If another kernel in the same repo has a recent perf win, check the commit and try the same technique on yours.
+- **Try a structurally different decomposition.** Not "one more block_dim sweep" but "what if I batched these atomic_adds" or "what if I reordered the inner two loops".
 
-Whichever you pick, write one line to `workspace/ideas-$CAMPAIGN.md` under `## Derived` describing what you tried and why. This is how the loop accumulates intelligence between iterations.
+Append a line to `learning.md` summarizing what you tried and why. This is how the loop accumulates intelligence.
 
 ### B5. Never stop
 
-You may NOT ask "should I keep going?", print "I think we're done", or wait for confirmation between experiments. There is no plateau exit, no budget exit, no "we hit the target" exit — additional gains compound and are still worth pursuing.
+You may NOT ask "should I keep going?", print "I think we're done", or wait for confirmation between experiments.
 
-You MAY (and should) print one-line progress between experiments — `exp 14: kept, e2e 297k → 305k, kernel 449us → 412us` — and a longer summary every 20 experiments.
+You MAY (and should):
+- Print one-line progress between experiments — `exp 14: kept, 449µs → 412µs (-8.3%)`.
+- Print a longer summary every 20 experiments.
 
-The only legitimate exits from Phase B are SIGINT/SIGTERM from a human, or `orchestrate.py next` returning `HALT` (watchdog detected infrastructure failure). On HALT, write `workspace/handoff-$CAMPAIGN.md` and exit.
-
----
-
-## Phase C — Acceptance gate (human-invoked)
-
-Phase C is no longer auto-triggered. The human (or a separate cron) runs `verify.py` against your campaign branch when ready to gate the work for review:
-
-```bash
-uv run verify.py --campaign "$CAMPAIGN" > verify.log 2>&1
-```
-
-`verify.py` runs the full pytest suite + a single full-size untraced run. If it fails, `git bisect` between the campaign branch and its base to find the offending commit, revert it, re-run.
+The only legitimate exit is SIGINT/SIGTERM from the human.
 
 ---
 
-## Output contract from `bench.py`
+## `results.tsv` format
 
-Every `bench.py` run prints these greppable keys at the bottom of run.log:
+Tab-separated, 5 columns:
 
 ```
-correctness:        PASS
-kernel_avg_us:      449.61
-kernel_total_ms:    229.7
-kernel_calls:       511
-e2e_throughput:     433156
-e2e_throughput_sigma: 1820
-e2e_throughput_sigma_pct: 0.42
-e2e_throughput_n:   3
-e2e_pct_of_h100:    54.54
-e2e_wall_seconds:   9.456
-peak_vram_mb:       142800
-peak_vram_pct:      72.4
-profile_overhead_pct: 31.2
+experiment	commit	metric	status	description
+0	a1b2c3d	449.61	baseline	initial
+1	b2c3d4e	412.30	keep	exp1: vec3 AABB load on broadphase.py:170 (-8.3%)
+2	c3d4e5f	451.20	discard	exp2: hoist sort_buffer.i_g (+0.4%, within noise)
+3	d4e5f6g	0.00	crash	exp3: block_dim=512 (OOM)
 ```
 
-`correctness` is one of `PASS|FAIL|CRASH|TIMEOUT`. Anything other than PASS aborts the bench before timing.
+Conventions:
+- `metric` is in whatever unit the bench reports (µs, throughput, GFLOPS).
+- `status` ∈ {`baseline`, `keep`, `discard`, `crash`}.
+- `description` starts with `expN:` and is a short one-line note.
+- For crashes, use `0` for the metric.
+- Do NOT commit `results.tsv` to git — leave it untracked.
 
-Note: the contract key `e2e_pct_of_h100` is a back-compat name. The actual percentage is computed against whatever `harness.toml::reference.reference_value` is set to (currently H100 = 794,280, but configurable per project).
+## `learning.md` format
+
+A markdown notebook YOU maintain. Append-only, organized by hypothesis class. Format:
+
+```markdown
+# Learning notes: $KERNEL_NAME
+
+## What's working
+- vec3 packing on AABB lists: exp14 +1.9%, exp19 +2.1%
+- inline qd.func calls when arity ≤ 3: exp22 +0.7%
+
+## What's a dead end (don't try again)
+- block_dim sweeps: 0/4 wins (exp1, exp4, exp9, exp17)
+- hoisting outer loop invariants: 1/5 wins; the compiler already does it
+
+## Last 5 reverts and why
+- exp33: fuse qfrc + gauss/cost loops -- monolith +1.2% register pressure regression
+- exp31: hoist crb out of i_d loop -- flat (LLVM already hoists)
+- ...
+
+## Ideas not yet tried
+- async global_load_lds for the inner AABB loop
+- bitfield pack the geom_idx into the lower 24 bits of pair_id
+- ...
+```
+
+You read this at the top of every loop iteration. You append after every experiment. This is your memory between iterations.
 
 ---
 
-## Reference example: one experiment cycle
+## Hard constraints
 
-This example uses the Genesis-on-MI300X campaigns and file paths. For a different project, the structure is identical; substitute your own campaign name, source file, and hypothesis vocabulary.
-
-```bash
-# 1. read state
-test -f workspace/HALT.flag && { echo halted; exit 0; }
-cat workspace/learning.md workspace/ideas-$CAMPAIGN.md
-uv run global_log.py digest --campaign $CAMPAIGN --last 50
-
-# 2. think (B1.5 -- bench.py REJECTS commits without these three lines)
-#    1. Current dominant bottleneck: AABB traversal, 38% of kernel time (top_5)
-#    2. Smallest change to move it:  broadphase.py:170 scalar->vec3 load
-#    3. Prior(working): 0.55 -- same pattern shipped in solve_body_monolith last week
-
-# 3. edit + commit
-git -C $GENESIS_SRC add -A
-git -C $GENESIS_SRC commit -m "exp 14: vec3 AABB load on broadphase.py:170
-
-1. Current dominant bottleneck: AABB traversal, 38% of kernel time
-2. Smallest change to move it:  scalar -> vec3 load at line 170
-3. Prior(working): 0.55 -- same pattern shipped in solve_body_monolith"
-
-# 4. run (3 trials, GPU clocks pinned, rubric enforced)
-uv run bench.py --campaign $CAMPAIGN --trials 3 > run.log 2>&1
-grep "^correctness:\|^kernel_avg_us:\|^e2e_throughput\|^peak_vram_mb:" run.log
-
-# 5. decide via B2; KEEP or git reset --hard HEAD~1
-
-# 6. record (4 calls in this order)
-COMMIT=$(git -C $GENESIS_SRC rev-parse --short HEAD)
-printf "14\t$CAMPAIGN\t$COMMIT\t412.3\t210.7\t447800\t56.4\tPASS\t142950\texp14: vec3 AABB load (KEPT)\n" >> results.tsv
-uv run orchestrate.py record --campaign $CAMPAIGN --kernel-avg-us 412.3 --e2e-throughput 447800 --status keep --description "exp14: vec3 AABB load"
-uv run summarize.py
-uv run global_log.py append --gpu $AUTOKERNEL_GPU_ID --campaign $CAMPAIGN \
-  --exp 14 --commit $COMMIT --kernel-avg-us 412.3 --e2e-throughput 447800 \
-  --status keep --description "exp14: vec3 AABB load"
-
-# 7. lesson
-echo "- exp14 lesson: vec3 packing on AABB list +1.9pp e2e; try same on velocity-list at L244" \
-  >> workspace/ideas-$CAMPAIGN.md
-
-# 8. loop
-uv run orchestrate.py next --campaign $CAMPAIGN  # CONTINUE (or HALT if drift)
-```
-
----
-
-## Hard constraints (compressed)
-
-1. **Edit only files in `target.json::edit_files`.** After every commit, `git diff HEAD~1 --name-only` should show only those.
-2. **Never modify the harness or contract.** See "What you CANNOT do" above.
-3. **Always run with `--trials 3`** (the default). Single-trial KEEPs are unreliable at the typical 1% noise floor.
-4. **Every hypothesis commit needs the B1.5 rubric.** `bench.py` enforces this; baselines and out-of-band runs use `--no-rubric-check`.
-5. **One focused change per commit.** Combinatorial commits are not attributable.
-6. **Correctness first.** A faster wrong kernel is auto-reverted. If you find a way to game correctness, stop and tell the human.
-7. **Respect the VRAM cap defined in `references/project_context.md`.** Anything over → revert.
-8. **Tag every kept commit with the experiment number** (`exp 14: ...`).
-9. **Do not commit `results.tsv`, `run.log`, `verify.log`, or `workspace/`.** They're gitignored — leave them.
-10. **NEVER STOP.** Only SIGINT or HALT. Plateaus are your problem to break, not the orchestrator's problem to terminate on.
+1. **Edit only the kernel source file** the human pointed at (or you confirmed). Do not touch the test, the bench harness, the build system, or anything outside the kernel's source file unless you genuinely cannot make progress without it (and even then, ask the human first).
+2. **Correctness first.** A faster wrong kernel is auto-reverted. If you find a way to game correctness, stop and tell the human — that's a bug.
+3. **One focused change per commit.** Combinatorial commits are not attributable.
+4. **Always include the B1.5 rubric** in your hypothesis commit body.
+5. **Tag every kept commit with the experiment number** (`exp 14: ...`). The git log is your audit trail.
+6. **Do not commit `results.tsv`, `run.log`, `correctness.log`, or `learning.md`.** They're per-session artifacts; gitignore them.
+7. **NEVER STOP.** Only SIGINT exits.
 
 ---
 
@@ -284,9 +248,8 @@ uv run orchestrate.py next --campaign $CAMPAIGN  # CONTINUE (or HALT if drift)
 
 End of an overnight run, you've produced:
 
-- `results.tsv` with 30-100 rows on your GPU (250-800 across the fleet), 5-15 of them KEEP
-- A clean commit stack on your campaign branch
-- `workspace/learning.md` showing which classes worked (signal for the next session)
-- `workspace/compiler_proposals.md` with 0-3 well-reasoned compiler-layer hypotheses for the human
-
-A great run lifts `kernel_avg_us` by 30%+ and the headline metric by 3-8%. See `references/project_context.md` for the historical "best win" benchmark on this project — your goal is to beat it.
+- `results.tsv` with 30-100 experiment rows, ~5-15 of them KEEP.
+- A clean commit stack on a perf branch (one commit per kept experiment).
+- `learning.md` showing which hypothesis classes worked and which are dead-ends — signal for the next session or the next teammate.
+- The kernel's metric improved by 5-30%+ depending on how much headroom there was.
+- Optionally: 0-3 entries in `compiler_proposals.md` for changes that need a compiler-layer fix the human will pick up.
