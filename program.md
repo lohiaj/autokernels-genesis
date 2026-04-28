@@ -42,7 +42,7 @@ grep -rn "$KERNEL_NAME" \
 
 Look for the *definition* (`def`, `void`, `__global__`, `@qd.kernel`, etc.), not just call sites. If the kernel name is ambiguous (matches multiple unrelated definitions), show the candidates to the human and ask which one. Do NOT silently pick.
 
-Both repos are cloned by default, so the kernel will be in one of them unless the user pointed `AUTOKERNEL_*_URL` at an unusual fork. If the grep returns nothing in either, ask the human to confirm the kernel name spelling.
+Both repos are cloned by default, so the kernel will be in one of them unless the user pointed `AUTOKERNEL_*_URL` at an unusual fork. If the grep returns multiple definitions, pick the most plausible (function definition over call site, longer body over stub) and proceed; note the alternatives in `learning.md`. Only halt if the grep returns ZERO matches across both sandboxes — that's an infrastructure issue, not an ambiguity.
 
 ### A2. Find the bench command
 
@@ -62,7 +62,7 @@ find "$SANDBOX/Quadrants" -type f \( -name "bench*" -o -name "*benchmark*" \) 2>
 ls $HOME/work/work/bench_*.py 2>/dev/null
 ```
 
-If the project has an existing `bench.py` / `benchmark.sh` / `Makefile bench` target — use it as-is. If you cannot find one in 5 minutes, **stop and ask the human**: *"I can't locate a benchmark for `$KERNEL_NAME` inside the sandbox. What command should I run to time it?"*
+If the project has an existing `bench.py` / `benchmark.sh` / `Makefile bench` target — use it as-is. If you find multiple candidates, pick the most plausible (closest to the kernel source > most recently modified > most-referenced from other tests) and proceed. Note the alternatives in `learning.md` so you can swap if the first choice produces no metric. Only halt at A5 if NO candidate exists *and* `~/work/work/bench_*.py` is empty — that's an infrastructure gap, not an ambiguity.
 
 Note: read-only references to files OUTSIDE the sandbox (e.g. a benchmark harness on the host) are fine — you just don't EDIT outside the sandbox.
 
@@ -75,7 +75,7 @@ SANDBOX="${AUTOKERNEL_SANDBOX:-$HOME/.cache/autokernels-genesis/sandbox}"
 find "$SANDBOX" -type f \( -name "test_*$KERNEL_NAME*" -o -name "*$KERNEL_NAME*test*" \) 2>/dev/null | head
 ```
 
-If there is no obvious test, ask the human. Never optimize without a correctness check — a faster wrong kernel is a regression.
+If there is no obvious test, pick the broadest available correctness scope (e.g. `pytest tests/test_rigid_physics.py -k <kernel_keyword>` or the project's full test suite). It's slower but it's better than no check. Never optimize without a correctness check — a faster wrong kernel is a regression. Halt at A5 only if NO test scope exists at all.
 
 ### A4. Run the baseline
 
@@ -114,9 +114,9 @@ If the host Python actually CAN import genesis (rare; some non-perf VMs are set 
 
 Extract the metric the bench reports (kernel time in µs, throughput, GFLOPS, whatever). This is your baseline.
 
-### A5. Confirm with the human
+### A5. Print recon summary and enter Phase B (DO NOT ASK)
 
-Print a one-block summary and ask the human to confirm before entering the loop:
+Print the summary as INFORMATION the human can read while scrolling by — do not block on a confirmation prompt. The human launched you specifically to run unattended; asking before the loop starts violates that. If the human wanted manual review, they wouldn't have typed "start optimizing for better perf gains."
 
 ```
 RECON SUMMARY
@@ -127,15 +127,23 @@ RECON SUMMARY
   baseline:    <metric_value> <unit>
   noise est.:  ±<X>% (from 2-3 quick repeats if cheap, else "unknown -- assuming 2%")
 
-Entering Phase B (autonomous loop). Ctrl-C to stop. OK?
+Entering Phase B. SIGINT to stop. Logging to results.tsv.
 ```
 
-When the human says go, initialize the result log and enter Phase B:
+Initialize the result log and enter Phase B *immediately* — no waiting:
 
 ```bash
 [ -f results.tsv ] || printf 'experiment\tcommit\tmetric\tstatus\tdescription\n' > results.tsv
 printf "0\t$(git rev-parse --short HEAD)\t<baseline>\tbaseline\tinitial\n" >> results.tsv
 ```
+
+The only reasons to halt before Phase B (rare; cheap if they happen):
+
+1. **Source not found.** A1 grep returned zero matches across both sandboxes for `$KERNEL_NAME`. Print the candidates you considered, ask once, then proceed.
+2. **Baseline correctness FAIL.** The unedited source doesn't pass its own correctness check. The repo is in a broken state; nothing the agent can do helps. Print the failing test output and stop.
+3. **Bench produces no metric.** The bench command ran but emitted nothing parseable as a number. The bench setup itself is broken. Print the bench tail and stop.
+
+These three are *infrastructure failures*, not "should I optimize this?" questions. Everything else — ambiguous source candidates, multiple bench commands, uncertainty about the baseline number — proceeds with the agent's best guess. If the guess is wrong, the loop will revert quickly and the agent updates `learning.md`. That's fast; asking is slow.
 
 ---
 
