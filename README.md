@@ -34,8 +34,8 @@ autokernels-genesis/
 ├── analysis.py                 morning dashboard (results.tsv -> progress.png)
 ├── references/                 frozen reference material (consult on demand)
 │   ├── index.md
-│   ├── project_context.md        baselines, top-8 kernel gap, shipped patterns
-│   └── mi300x_notes.md         CDNA3 / gfx942 hardware cheatsheet
+│   ├── project_context.md      per-project: project baselines, top-N kernel gap, shipped patterns
+│   └── hardware_notes.md       per-GPU: chip details, anti-patterns, profiler invocations
 ├── kernels/                    per-campaign manifests
 │   ├── func_broad_phase/
 │   ├── kernel_step_1_2/

@@ -7,10 +7,26 @@ change between experiments.
 
 | File | Contains | When to consult |
 |---|---|---|
-| `project_context.md` | Project baselines, top-8 kernel gap, layer model, shipped-pattern catalogue | At Phase A setup; on B5 escalation when picking a "shipped pattern from a different campaign" |
-| `mi300x_notes.md` | CDNA3/gfx942 hardware cheatsheet, anti-patterns, profiler invocations | At Phase A setup; when reasoning about LDS bank conflicts, register pressure, occupancy, or profiler output |
+| `project_context.md` | Project baselines, top-N kernel gap, layer model, shipped-pattern catalogue. **Per-project** -- replace contents to retarget the harness. | At Phase A setup; on B5 escalation when picking a "shipped pattern from a different campaign" |
+| `hardware_notes.md`  | GPU chip details, peak compute, anti-patterns, profiler invocations. **Per-GPU** -- replace contents to retarget. | At Phase A setup; when reasoning about VGPR/AGPR pressure, LDS bank conflicts, occupancy, or profiler output |
 
-The `program.md` operating manual is the only doc you need open during the
-loop. The orchestration tools (`orchestrate.py`, `summarize.py`, `global_log.py`,
-`watchdog.py`) and the per-campaign `kernels/$CAMPAIGN/{target.json,playbook.md}`
-are also load-bearing -- everything else is reference.
+The `program.md` operating manual is project-agnostic -- it assumes the agent
+will read these two files for project + hardware context. The harness Python
+(`bench.py`, `prepare.py`, ...) reads project + platform constants from
+[`harness.toml`](../harness.toml) at the repo root, not from these files.
+
+## To retarget at a different project
+
+Both files are templates; the current contents are the Genesis-on-MI300X
+instance. To use this harness for a different project:
+
+1. Replace `project_context.md` with your project's project numbers,
+   baselines, top-N kernel gap, layer model, shipped-pattern catalog.
+2. Replace `hardware_notes.md` with your GPU's chip details, peak compute,
+   anti-patterns, profiler invocations.
+3. Edit `harness.toml` at the repo root for executable values (container
+   image, bench script path, profiler command, GPU clock-pin command, etc.).
+4. Add per-campaign manifests to `kernels/<your_campaign>/{target.json,
+   playbook.md, classes.json}`.
+
+The Python harness and `program.md` should not need any edits.

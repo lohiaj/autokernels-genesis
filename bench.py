@@ -29,7 +29,7 @@ Exit codes:
   1  -- harness error (container missing, target.json malformed, etc.)
   2  -- bench timed out
 
-H100 reference (constant): 794280 env*steps/s @ 8192/500/FP32 -- see references/project_context.md
+Reference baseline + bench config: harness.toml. Project context: references/project_context.md.
 """
 
 from __future__ import annotations

@@ -1,6 +1,19 @@
+# Project context
+
+> **Template note.** This file is the *Genesis-on-MI300X instance* of the
+> project context template. To retarget the harness at a different project
+> (e.g. Composable Kernel benchmarks, AITER, hipBLASLt), replace the contents
+> below with your project's equivalents, keeping the section structure
+> (E2E baselines / Top-N kernel gap / Layer model / Shipped
+> patterns / Hard-coded gotchas). The harness reads this file by path; nothing
+> in `bench.py` or the agent loop hard-codes the project name.
+
 # the production workload / Genesis-on-MI300X — Context (FROZEN)
 
-This file is the agent's source of truth for what's already known. Numbers here are baselines and targets — do not change them; the orchestrator reads them to compute "improvement" deltas. Last updated from `Genesis_Benchmark(April_21).csv` and `h100_vs_mi300x_kernel_comparison.txt`.
+This file is the agent's source of truth for what's already known about this
+specific project. Numbers here are baselines and targets — do not change them;
+the orchestrator reads them to compute "improvement" deltas. Last updated from
+`Genesis_Benchmark(April_21).csv` and `h100_vs_mi300x_kernel_comparison.txt`.
 
 ## Workload
 

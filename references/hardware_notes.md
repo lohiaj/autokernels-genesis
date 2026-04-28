@@ -1,3 +1,10 @@
+# Hardware notes
+
+> **Template note.** This file is the *MI300X / CDNA3 / gfx942 instance* of
+> the hardware notes template. Replace contents with your GPU's chip details,
+> peak compute table, common gotchas, and profiler invocations to retarget.
+> Keep the section structure so the agent's expectations stay stable.
+
 # MI300X / CDNA3 / gfx942 — Hardware cheatsheet (FROZEN)
 
 Read once at setup. Do not modify mid-experiment.
