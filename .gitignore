@@ -49,6 +49,10 @@ runs/
 # Workspace (runtime artifacts: HALT.flag, learning.md, ideas-*.md, logs/, etc.)
 workspace/
 
+# Sandbox (sandbox.py defaults to ~/.cache/... but ignore at repo root in case
+# someone overrides AUTOKERNEL_SANDBOX to a relative path)
+sandbox/
+
 # Editor / IDE / OS
 .vscode/
 .idea/

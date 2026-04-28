@@ -52,6 +52,20 @@ cat $HOME/autokernels-genesis/results.tsv   # full attempt log (kept + reverted 
 cat $HOME/autokernels-genesis/learning.md   # what worked / what's dead-end
 ```
 
+## FAQ
+
+**Q: Does it only work for Genesis?**
+A: No — it works on both **Genesis and Quadrants** kernels. The agent searches both sandbox repos for your kernel name and figures out which one to edit. Genesis is cloned by default; for Quadrants set `AUTOKERNEL_QUADRANTS_URL=<your_amd_team_url>` before running.
+
+**Q: Will it corrupt my existing changes or upgraded kernels I'm working on?**
+A: No. The program runs in a **git sandbox** at `~/.cache/autokernels-genesis/sandbox/`. Your existing checkouts of Genesis or Quadrants (under `~/work/` or anywhere else) are never touched. Each session creates a fresh branch named `autokernel/<kernel>-<timestamp>` so even repeated runs don't collide. `git reset --hard` only happens inside the sandbox.
+
+**Q: Will I have to pull the Quadrants and Genesis repos into the dir?**
+A: No. The program **pulls the latest release branch of the repos automatically** on first run via `sandbox.py setup`. Subsequent runs `git fetch + reset --hard` to keep up. Your `cwd` and your own clones are not modified.
+
+**Q: Are contributions open?**
+A: Yes — issues and PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the (very short) guide.
+
 ## Advanced: 8-GPU multi-campaign mode
 
 For coordinated runs across 8 MI300X with multiple kernel campaigns running in parallel (the original Genesis-on-MI300X integration), see [USAGE.md](USAGE.md). That mode adds:
