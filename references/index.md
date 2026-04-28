@@ -20,7 +20,7 @@ will read these two files for project + hardware context. The harness Python
 Both files are templates; the current contents are the Genesis-on-MI300X
 instance. To use this harness for a different project:
 
-1. Replace `project_context.md` with your project's project numbers,
+1. Replace `project_context.md` with your project's baseline numbers,
    baselines, top-N kernel gap, layer model, shipped-pattern catalog.
 2. Replace `hardware_notes.md` with your GPU's chip details, peak compute,
    anti-patterns, profiler invocations.

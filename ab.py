@@ -83,12 +83,17 @@ DEFAULT_GPU_BUSY_THRESHOLD = 5.0       # spec 2.9: > 5% triggers wait
 DEFAULT_GPU_WAIT_MAX_S = 300           # spec 2.9: 5 min then abort
 DEFAULT_BASELINE_DRIFT_PCT = 15.0      # spec 2.2: > 15% from previous baseline = abort
 
-# spec 2.11: Quadrants-Jenkins parity
-DEFAULT_JENKINS_PIN_FILE = Path("$HOME/work/v2-dev/research/quadrants-pin.txt")
+# spec 2.11 (simplified): stack alignment via git ancestry, not pin file.
+# Local Quadrants commit must be an ancestor of the production branch.
+# Catches the C2 disaster (a local cherry-pick that isn't on the prod branch
+# would not be an ancestor of it) without the pin-file/provenance ceremony.
+QUADRANTS_PROD_BRANCH = os.environ.get("AUTOKERNEL_QUADRANTS_PROD_BRANCH",
+                                       "origin/amd-integration")
 QUADRANTS_BANNER_RE = re.compile(r"\[Quadrants\][^\n]*?commit\s+([0-9a-f]+)", re.I)
 
-# spec 2.12: calibration cache TTL
-DEFAULT_CALIBRATION_TTL_HOURS = 24
+# spec 2.12: calibration cache TTL (7 days; calibration is a stack-property
+# check, not a per-day check -- only invalidates when the stack rebuilds).
+DEFAULT_CALIBRATION_TTL_HOURS = 168
 
 WORKSPACE = Path(__file__).resolve().parent / "workspace"
 
@@ -342,138 +347,94 @@ def get_local_quadrants_commit() -> str | None:
     return m.group(1).strip()
 
 
-def get_jenkins_quadrants_pin(pin_file: Path = DEFAULT_JENKINS_PIN_FILE
-                              ) -> tuple[str | None, str]:
-    """Read the cached Jenkins-pinned Quadrants commit AND its source provenance.
-    File format:
-
-        <commit_sha>
-        # source: <provenance>            <-- e.g. "manual entry" / "fetched from build #123"
-        # any other comment metadata
-
-    Returns (sha or None, source_string). source_string is "manual" if the
-    file's source comment mentions manual entry, "jenkins" if it mentions a
-    Jenkins/build URL, or "unknown" otherwise.
-
-    The source matters: a manually-entered pin that happens to equal the local
-    Quadrants commit is the C2 trap (false `stack_aligned: true`). The caller
-    uses this to refuse to treat such pins as authoritative."""
-    if not pin_file.exists():
-        return None, "missing"
-    sha = None
-    source = "unknown"
-    try:
-        for line in pin_file.read_text().splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if not stripped.startswith("#"):
-                if sha is None:
-                    sha = stripped
-                continue
-            low = stripped.lower()
-            if "manual entry" in low:
-                source = "manual"
-            elif any(s in low for s in ("jenkins", "build #", "build/", "pinned-manifest", "aifoundry.amd.com")):
-                source = "jenkins"
-    except OSError as e:
-        warn(f"could not read {pin_file}: {e}")
-        return None, "error"
-    return sha, source
+def _find_quadrants_repo() -> str | None:
+    """Locate a host-side Quadrants git repo we can run ancestry checks against.
+    Order: sandbox clone (always present after `sandbox.py setup`), then
+    AUTOKERNEL_QUADRANTS_REPO env var, then ~/work/quadrants."""
+    candidates = []
+    sb = os.environ.get("AUTOKERNEL_SANDBOX")
+    if sb:
+        candidates.append(os.path.join(sb, "Quadrants"))
+    candidates.append(os.path.expanduser(
+        "~/work/.cache/autokernels-genesis-sandbox/Quadrants"))
+    env_repo = os.environ.get("AUTOKERNEL_QUADRANTS_REPO")
+    if env_repo:
+        candidates.append(env_repo)
+    candidates.append(os.path.expanduser("~/work/quadrants"))
+    for c in candidates:
+        if os.path.isdir(os.path.join(c, ".git")):
+            return c
+    return None
 
 
 def assert_stack_aligned(skip: bool = False) -> dict:
-    """Verify local Quadrants commit == Jenkins-pinned commit. Returns a dict
-    suitable for embedding in trial JSON. Aborts on mismatch unless skip=True.
+    """Verify local Quadrants commit is an ancestor of the production branch
+    (default: origin/amd-integration). Pure git ancestry check -- no pin file,
+    no Jenkins network call.
 
-    Trust-hierarchy rule (the AGENTS.md §3.10 footnote): a pin file populated
-    by `ab.py jenkins-pin --pin <sha>` (source: "manual entry") that happens to
-    equal the local Quadrants commit is REFUSED as authoritative. That's the
-    exact false-positive the C2 disaster taught: an operator who guessed the
-    pin from their own local commit produces stack_aligned=true while the
-    actual Jenkins Quadrants is something different. Force a real Jenkins-
-    sourced pin (or accept --skip-stack-check with explicit warning)."""
+    Catches the C2 disaster: a local cherry-pick that isn't on amd-integration
+    would not be an ancestor of origin/amd-integration, so the check fails.
+    Returns a dict suitable for embedding in trial JSON. Aborts on mismatch
+    unless skip=True."""
     local = get_local_quadrants_commit()
-    pinned, source = get_jenkins_quadrants_pin()
     info_dict = {
         "local_quadrants_commit": local,
-        "jenkins_quadrants_commit": pinned,
-        "pin_source": source,
+        "prod_branch": QUADRANTS_PROD_BRANCH,
         "stack_aligned": False,
-        "pin_file": str(DEFAULT_JENKINS_PIN_FILE),
     }
     if local is None:
         if not skip:
             warn("local Quadrants commit unknown; treating as unaligned. "
                  "Pass --skip-stack-check to bypass this check explicitly.")
         return info_dict
-    if pinned is None:
+
+    repo = _find_quadrants_repo()
+    if repo is None:
         if skip:
             info_dict["stack_aligned"] = None
             return info_dict
-        die(
-            f"QUADRANTS_VERSION_MISMATCH (no Jenkins pin available)\n"
-            f"  local Quadrants commit:  {local}\n"
-            f"  Jenkins pin file:        {DEFAULT_JENKINS_PIN_FILE} (missing)\n\n"
-            f"Cannot verify the local stack matches Jenkins's production stack. "
-            f"Either:\n"
-            f"  1. Fetch the Jenkins pinned commit from the latest green pre-submit\n"
-            f"     pipeline build at build.aifoundry.amd.com -> pinned-manifest-...yml\n"
-            f"     -> sources.repositories[name=quadrants].revision, then:\n"
-            f"       uv run ab.py jenkins-pin --pin <sha> --provenance 'jenkins build #N'\n"
-            f"  2. Pass --skip-stack-check to bypass (NOT recommended; risks the C2-style\n"
-            f"     'looks great locally, regresses on Jenkins' failure mode)."
-        )
-    if not local.startswith(pinned[:8]) and not pinned.startswith(local[:8]):
-        if skip:
-            info_dict["stack_aligned"] = False
-            warn(f"QUADRANTS MISMATCH (skipping per --skip-stack-check): "
-                 f"local={local} jenkins={pinned}")
-            return info_dict
-        die(
-            f"QUADRANTS_VERSION_MISMATCH\n"
-            f"  local Quadrants commit:    {local}\n"
-            f"  Jenkins pin (production):  {pinned}  (source: {source})\n\n"
-            f"This is the C2 failure mode: a local Quadrants cherry-pick that Jenkins\n"
-            f"doesn't have can flip a kernel's emit pattern (inlined vs outlined,\n"
-            f"register allocation, etc), turning a +2% local win into a -7% Jenkins\n"
-            f"regression on identical Genesis source.\n\n"
-            f"Resolve before running A/B:\n"
-            f"  1. Rebuild Quadrants against the Jenkins pin (~5-15 min on warm LLVM cache):\n"
-            f"     cd $HOME/work/quadrants && git fetch && git checkout {pinned}\n"
-            f"     <build + reinstall the wheel>\n"
-            f"  2. Or pull a prebuilt wheel matching {pinned} if your team publishes them.\n"
-            f"  3. Or pass --skip-stack-check to override (NOT recommended -- this is\n"
-            f"     exactly how the C2 disaster shipped)."
-        )
-    # Trust-hierarchy guard: a manually-entered pin matching local Quadrants is
-    # circular evidence (the operator may have just typed in their own commit).
-    if source == "manual":
-        if skip:
-            info_dict["stack_aligned"] = None
-            warn(f"PIN_SOURCE_UNTRUSTWORTHY (skipping per --skip-stack-check): "
-                 f"pin matches local but source is manual entry; could be circular.")
-            return info_dict
-        die(
-            f"PIN_SOURCE_UNTRUSTWORTHY\n"
-            f"  local Quadrants commit:  {local}\n"
-            f"  pin file SHA:            {pinned}  (source: manual entry)\n\n"
-            f"The pin file matches the local Quadrants commit, but the pin's source\n"
-            f"is 'manual entry' -- meaning an operator typed the SHA via\n"
-            f"`ab.py jenkins-pin --pin <sha>`. There's no evidence this SHA actually\n"
-            f"matches what Jenkins's pre-submit pipeline pulls. If the operator\n"
-            f"typed in the local commit (the C2 trap), `stack_aligned: true` would\n"
-            f"silently lie.\n\n"
-            f"Re-pin with provenance pointing at a Jenkins source:\n"
-            f"  uv run ab.py jenkins-pin --pin <sha> --provenance 'jenkins build #N at <URL>'\n"
-            f"...where <sha> is the Quadrants commit recorded in the latest green\n"
-            f"pre-submit-amd-integration build's pinned-manifest YAML.\n\n"
-            f"Or pass --skip-stack-check to override (NOT recommended)."
-        )
-    info_dict["stack_aligned"] = True
-    info(f"stack alignment OK: local Quadrants {local} matches Jenkins pin {pinned} "
-         f"(source: {source})")
-    return info_dict
+        die(f"QUADRANTS_REPO_NOT_FOUND\n"
+            f"Could not locate a local Quadrants git repo to verify ancestry.\n"
+            f"Set AUTOKERNEL_QUADRANTS_REPO=<path> or ensure sandbox is set up.\n"
+            f"Or pass --skip-stack-check to override.")
+
+    info_dict["quadrants_repo"] = repo
+    # Refresh remote so we're checking against current prod head.
+    if "/" in QUADRANTS_PROD_BRANCH:
+        remote, branch = QUADRANTS_PROD_BRANCH.split("/", 1)
+        run(["git", "-C", repo, "fetch", remote, branch], timeout=60)
+
+    rc, _ = run(["git", "-C", repo, "merge-base", "--is-ancestor",
+                 local, QUADRANTS_PROD_BRANCH])
+    if rc == 0:
+        info_dict["stack_aligned"] = True
+        info(f"stack alignment OK: local Quadrants {local} is an ancestor of "
+             f"{QUADRANTS_PROD_BRANCH}")
+        return info_dict
+
+    # Show what's local-only
+    rc2, extra = run(["git", "-C", repo, "log", "--oneline",
+                      f"{QUADRANTS_PROD_BRANCH}..{local}"], timeout=10)
+    extra_block = extra.strip() if rc2 == 0 and extra.strip() else "    <unknown>"
+    if skip:
+        info_dict["stack_aligned"] = False
+        warn(f"QUADRANTS_NOT_ON_PROD_BRANCH (skipping per --skip-stack-check): "
+             f"local={local} is not an ancestor of {QUADRANTS_PROD_BRANCH}")
+        return info_dict
+    die(
+        f"QUADRANTS_NOT_ON_PROD_BRANCH\n"
+        f"  local Quadrants commit:   {local}\n"
+        f"  production branch:        {QUADRANTS_PROD_BRANCH}\n"
+        f"  quadrants repo:           {repo}\n"
+        f"  local-only commits:\n{extra_block}\n\n"
+        f"This is the C2 failure mode: a local cherry-pick that isn't on the\n"
+        f"prod branch can flip a kernel's emit pattern (inlined vs outlined,\n"
+        f"register allocation), turning a +2% local win into a -7% prod regression.\n\n"
+        f"Resolve:\n"
+        f"  cd {repo} && git fetch && git checkout {QUADRANTS_PROD_BRANCH}\n"
+        f"  <rebuild + reinstall the wheel>\n"
+        f"Or pass --skip-stack-check to override (NOT recommended)."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1343,67 +1304,47 @@ def cmd_ab(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_jenkins_pin(args: argparse.Namespace) -> int:
-    """Manage the Jenkins-pinned Quadrants commit cache (spec 2.11).
+    """Verify local Quadrants is on the production branch (ancestry check).
 
-    Subcommand modes:
-      --pin <sha>    : write <sha> as the pinned commit
-      --show         : print current pinned + local commits side-by-side
-      --check        : exit 0 if local matches Jenkins pin, 2 otherwise
+    Replaces the prior pin-file/provenance machinery with a pure git
+    ancestry check against $AUTOKERNEL_QUADRANTS_PROD_BRANCH (default
+    origin/amd-integration). --pin and --provenance are accepted as no-ops
+    for backwards compatibility.
     """
-    pin_file = DEFAULT_JENKINS_PIN_FILE
     if args.pin:
-        pin_file.parent.mkdir(parents=True, exist_ok=True)
-        # Provenance line decides whether assert_stack_aligned() trusts this pin.
-        # Default is "manual entry" (which the trust-hierarchy check rejects if
-        # the SHA happens to match local Quadrants -- that's the C2 trap).
-        # Pass --provenance "jenkins build #123 at <URL>" to mark as authoritative.
-        provenance = (args.provenance
-                      or "manual entry via `ab.py jenkins-pin --pin <sha>` "
-                         "(NOT trusted as Jenkins-authoritative; pass --provenance "
-                         "to record the actual source)")
-        pin_file.write_text(
-            f"{args.pin}\n"
-            f"# recorded at {datetime.now(timezone.utc).isoformat()}\n"
-            f"# source: {provenance}\n"
-        )
-        # Detect by whether --provenance was explicitly given (the fallback string
-        # itself contains "jenkins" inside its warning text, which would falsely
-        # trip a substring check).
-        is_jenkins_sourced = bool(args.provenance) and any(
-            s in args.provenance.lower()
-            for s in ("jenkins", "build #", "pinned-manifest", "aifoundry.amd.com"))
-        if is_jenkins_sourced:
-            print(f"jenkins-pin: wrote {args.pin} to {pin_file} (source: jenkins-authoritative)")
-        else:
-            print(f"jenkins-pin: wrote {args.pin} to {pin_file}")
-            print(f"  WARNING: source defaulted to 'manual entry'. The pin will NOT be")
-            print(f"  trusted by `ab.py ab` if it equals the local Quadrants commit")
-            print(f"  (that's the C2 trap). Re-run with --provenance 'jenkins build #N'")
-            print(f"  once you've confirmed the SHA actually matches Jenkins's pinned manifest.")
-        return 0
-    if args.show or args.check:
-        local = get_local_quadrants_commit()
-        pinned, source = get_jenkins_quadrants_pin()
-        print(f"local Quadrants:    {local}")
-        print(f"Jenkins pin:        {pinned}  (source: {source})")
-        print(f"pin file:           {pin_file} ({'exists' if pin_file.exists() else 'MISSING'})")
-        if args.check:
-            if not (local and pinned):
-                print("aligned: NO  (missing local or pin)")
-                return 2
-            sha_match = local.startswith(pinned[:8]) or pinned.startswith(local[:8])
-            if not sha_match:
-                print("aligned: NO  (SHA mismatch)")
-                return 2
-            if source == "manual":
-                print("aligned: NO  (pin source is manual entry; refused as untrustworthy)")
-                return 2
-            print("aligned: YES")
+        warn("jenkins-pin --pin is deprecated and a no-op. "
+             "Stack alignment is now determined by git ancestry against "
+             f"{QUADRANTS_PROD_BRANCH}. Set $AUTOKERNEL_QUADRANTS_PROD_BRANCH "
+             "to override.")
+    local = get_local_quadrants_commit()
+    repo = _find_quadrants_repo()
+    print(f"local Quadrants:    {local}")
+    print(f"prod branch:        {QUADRANTS_PROD_BRANCH}")
+    print(f"quadrants repo:     {repo or 'NOT FOUND'}")
+    if not args.check and not args.show:
+        # default: behave like --check
+        args.check = True
+    if args.check:
+        if local is None or repo is None:
+            print("aligned: NO  (missing local commit or repo)")
+            return 2
+        if "/" in QUADRANTS_PROD_BRANCH:
+            remote, branch = QUADRANTS_PROD_BRANCH.split("/", 1)
+            run(["git", "-C", repo, "fetch", remote, branch], timeout=60)
+        rc, _ = run(["git", "-C", repo, "merge-base", "--is-ancestor",
+                     local, QUADRANTS_PROD_BRANCH])
+        if rc == 0:
+            print(f"aligned: YES  (local {local} is an ancestor of {QUADRANTS_PROD_BRANCH})")
             return 0
-        return 0
-    print("jenkins-pin: pass --pin <sha>, --show, or --check (see --help)",
-          file=sys.stderr)
-    return 1
+        rc2, extra = run(["git", "-C", repo, "log", "--oneline",
+                          f"{QUADRANTS_PROD_BRANCH}..{local}"], timeout=10)
+        if rc2 == 0 and extra.strip():
+            print("local-only commits:")
+            for line in extra.strip().splitlines():
+                print(f"  {line}")
+        print(f"aligned: NO  (local has commits not on {QUADRANTS_PROD_BRANCH})")
+        return 2
+    return 0
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:

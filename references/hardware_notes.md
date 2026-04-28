@@ -29,7 +29,7 @@ Read once at setup. Do not modify mid-experiment.
 - FP64 vector: ~81 TFLOPS.
 - FP64 MFMA: ~163 TFLOPS.
 
-The the production benchmark is FP32 at project request — MFMA is mostly not the lever; bandwidth and occupancy are.
+The production benchmark is FP32 per project requirements — MFMA is mostly not the lever; bandwidth and occupancy are.
 
 ## Concrete patterns the Genesis kernels keep tripping over
 

@@ -8,7 +8,7 @@
 > patterns / Hard-coded gotchas). The harness reads this file by path; nothing
 > in `bench.py` or the agent loop hard-codes the project name.
 
-# the production workload / Genesis-on-MI300X — Context (FROZEN)
+# the production workload (Genesis-on-MI300X) — Context (FROZEN)
 
 This file is the agent's source of truth for what's already known about this
 specific project. Numbers here are baselines and targets — do not change them;
