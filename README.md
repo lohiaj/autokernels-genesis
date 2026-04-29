@@ -1,84 +1,67 @@
-# autokernels-genesis
+# autokernels
 
-Autonomous LLM-driven research loop for AMD GPU kernel optimization. Hand it a kernel name; it loops forever — proposes a change, benchmarks, keeps on improvement, reverts otherwise — until you Ctrl-C.
+Autonomous GPU-kernel optimization loop. An LLM agent proposes a change,
+runs your benchmark, keeps the change if score improved past the noise
+floor, reverts otherwise. Repeats until told to stop. Adapted from
+Karpathy's autoresearch pattern; the only domain-specific bit is that the
+metric is "kernel/e2e throughput" instead of "training loss."
 
-## Quick start (4 steps)
+Three files:
 
-```bash
-git clone https://github.com/lohiaj/autokernels-genesis.git
-cd autokernels-genesis
-claude    # or `codex` -- any Claude Code / agent CLI
-```
+| file | what it is |
+|---|---|
+| `bench.py` | The verdict tool. Runs your bench N times, checks correctness, compares to baseline, emits KEEP/REVERT JSON. |
+| `prompt.md` | The agent prompt. Describes the loop. Hand this to your LLM agent. |
+| `README.md` | This file. |
 
-Then in the agent CLI, type:
+That's the whole product. No orchestration, no sandbox, no daemon, no
+manifest of hypothesis classes.
 
-```
-my kernel name is YOUR_KERNEL_NAME. read program.md and start optimizing for better perf gains.
-```
-
-That's it. The agent reads `program.md`, locates your kernel in the source tree, finds its bench + correctness command, runs a baseline, confirms with you, then loops until you stop it.
-
-## Prerequisites
-
-The agent assumes you're on an AMD perf VM with the standard toolchain pre-installed:
-
-- ROCm 6.x (`rocm-smi`, `rocprofv3`, `omniperf`)
-- Python 3.10+
-- Git
-- For **Genesis / Quadrants** kernels: a running perf container (e.g. `gbench`) with Genesis + Quadrants + PyTorch-ROCm installed and `$AUTOKERNEL_ROOT` (default `~/work`) mounted into it. The agent runs benches via `docker exec` against this container — the host Python typically doesn't have these packages.
-- For **non-Genesis** kernels (Composable Kernel, AITER, hipBLASLt, custom): no Docker required; the agent just runs the bench command directly.
-
-No setup script, no harness configuration. The agent does discovery + clones the repos itself into a sandbox.
-
-## What the agent does
-
-1. **Reconnaissance** (~10 min, with you in the loop): `grep` for your kernel by name, find the bench/test commands, run the baseline. Confirms with you before going autonomous.
-2. **Loop forever**:
-   - Form one focused hypothesis (must answer the three-question rubric in the commit body — bottleneck, smallest change, prior probability).
-   - Edit the kernel source file.
-   - Run correctness; revert on FAIL.
-   - Run the bench; KEEP if metric improved by ≥ 2σ, else revert.
-   - Append to `results.tsv`; update `learning.md` with the lesson.
-3. **You wake up** to 30-100 experiments, 5-15 of them kept on a clean commit stack, and a `learning.md` summarizing which idea classes worked.
-
-Full details — the loop, the rubric, the KEEP rule, the stuck handler — live in [`program.md`](program.md). The agent reads it; you don't have to.
-
-## Output
-
-After an overnight run, `cd` into your kernel's source repo and:
+## Use
 
 ```bash
-git log --oneline                    # the kept commits, one per experiment
-cat $HOME/autokernels-genesis/results.tsv   # full attempt log (kept + reverted + crashed)
-cat $HOME/autokernels-genesis/learning.md   # what worked / what's dead-end
+# 1. Tell bench.py how to run your bench (must print "score: <number>" to stdout)
+export AUTOKERNEL_BENCH_CMD="python my_bench.py --some-flags"
+export AUTOKERNEL_TEST_CMD="pytest tests/"   # optional; "" to skip
+export AUTOKERNEL_TRIALS=3                   # default; raise if your bench is noisy
+
+# 2. Establish the baseline (first call writes baseline.json with no comparison)
+python bench.py
+
+# 3. Start your agent with the prompt
+#    (whatever your agent CLI is — Claude Code, Cursor, Aider, etc.)
+your-agent < prompt.md
 ```
 
-## FAQ
+The agent will read `prompt.md`, run the loop, and write each accepted
+change as a git commit. `SESSION_LOG.md` is its memory between attempts.
 
-**Q: Does it only work for Genesis?**
-A: No — it works on both **Genesis and Quadrants** kernels. Both are cloned automatically from the public ROCm forks (`github.com/ROCm/Genesis`, `github.com/ROCm/quadrants`); the agent searches both sandbox repos for your kernel name and figures out which one to edit. Override the URLs or branches via `AUTOKERNEL_GENESIS_URL` / `AUTOKERNEL_GENESIS_BRANCH` / `AUTOKERNEL_QUADRANTS_URL` / `AUTOKERNEL_QUADRANTS_BRANCH` if you need a fork.
+## Configuration
 
-**Q: Will it corrupt my existing changes or upgraded kernels I'm working on?**
-A: No. The program runs in a **git sandbox** at `~/.cache/autokernels-genesis/sandbox/`. Your existing checkouts of Genesis or Quadrants (under `$HOME/work/` or anywhere else) are never touched. Each session creates a fresh branch named `autokernel/<kernel>-<timestamp>` so even repeated runs don't collide. `git reset --hard` only happens inside the sandbox.
+All flags optional; sensible defaults baked into `bench.py`:
 
-**Q: Will I have to pull the Quadrants and Genesis repos into the dir?**
-A: No. The program **pulls the latest release branch of both repos automatically** on first run via `sandbox.py setup` (defaults: `release/0.4.4.amdperf` for Genesis, `amd-integration` for Quadrants). Subsequent runs `git fetch + reset --hard` to keep up. Your `cwd` and your own clones are not modified.
+| env var | default | what |
+|---|---|---|
+| `AUTOKERNEL_BENCH_CMD` | (required) | shell command, must print `score: <float>` |
+| `AUTOKERNEL_TEST_CMD` | `""` | correctness command; exit 0 = pass; empty skips |
+| `AUTOKERNEL_TRIALS` | `3` | how many bench runs to average |
+| `AUTOKERNEL_TIMEOUT_S` | `600` | per-trial timeout |
+| `AUTOKERNEL_SIGMA_K` | `2.0` | improvement must exceed K * combined_sigma |
 
-**Q: Are contributions open?**
-A: Yes — issues and PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the (very short) guide.
+## Why this is short
 
-## Advanced: 8-GPU multi-campaign mode
+Earlier versions of this repo had ~1600 lines of harness, sandbox, watchdog,
+classifier, multi-GPU orchestrator, and a five-way verdict taxonomy. None of
+that was the value prop. The value prop is the loop: *propose, measure,
+keep or revert, repeat.* Karpathy figured this out for LLM training; we are
+applying it to GPU kernels. Everything else was scope creep added in
+response to specific incidents — and most incidents are better surfaced to
+the human than papered over with more code.
 
-For coordinated runs across 8 MI300X with multiple kernel campaigns running in parallel (the original Genesis-on-MI300X integration), see [USAGE.md](USAGE.md). That mode adds:
-
-- A campaign manifest system (`kernels/<campaign>/target.json`)
-- A frozen bench harness (`bench.py`) with multi-trial sigma + GPU clock pinning + rubric enforcement
-- A cross-agent shared loss log (`global_log.py`) so 8 agents avoid duplicate dead-ends
-- A watchdog daemon (`watchdog.py`) for indefinite-run safety + drift detection
-- An 8-GPU launcher (`launcher/launch_8gpu.sh`)
-
-You don't need any of that for a single-kernel single-GPU optimization session — the simple flow above is the whole product.
+If you need 8-GPU multi-campaign orchestration, run 8 instances of this in
+8 terminals. The "global loss log" is `git log --all --oneline` across
+branches.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+See `LICENSE`.
